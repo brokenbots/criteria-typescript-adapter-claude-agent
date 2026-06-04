@@ -32,15 +32,15 @@ cp bin/criteria-adapter-claude-agent ~/.criteria/plugins/
 
 ## Configuration
 
-### Environment Variables
+### Secrets
 
-| Variable | Description |
-|---|---|
-| `ANTHROPIC_API_KEY` | API key for Anthropic first-party access |
-| `ANTHROPIC_AUTH_TOKEN` | Alternative auth token (e.g. for Bedrock / Vertex via proxy) |
-| `ANTHROPIC_BASE_URL` | Override the API base URL |
+The adapter reads the following secrets via `helpers.secrets.get()`. Configure them in your Criteria environment or orchestrator secret store.
 
-These can also be supplied as adapter config fields (see below), which takes precedence over environment variables.
+| Secret | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | **yes** | API key for Anthropic first-party access |
+| `ANTHROPIC_AUTH_TOKEN` | no | Alternative auth token (e.g. for Bedrock / Vertex via proxy) |
+| `ANTHROPIC_BASE_URL` | no | Override the API base URL |
 
 ### Adapter Config Fields
 
@@ -52,9 +52,6 @@ Declared on the `adapter` block. Shared across all steps that use this adapter i
 | `cwd` | string | no | Working directory for the agent. Defaults to the process working directory. |
 | `system_prompt` | string | no | Additional system prompt appended to every execute call. Outcome instructions are always prepended automatically. |
 | `thinking` | bool | no | Enable adaptive thinking mode (`true`/`false`). |
-| `api_key` | string | no | Sets `ANTHROPIC_API_KEY` for this adapter instance. |
-| `auth_token` | string | no | Sets `ANTHROPIC_AUTH_TOKEN` for this adapter instance. |
-| `base_url` | string | no | Sets `ANTHROPIC_BASE_URL` for this adapter instance. |
 
 ### Step Input Fields
 
@@ -122,7 +119,7 @@ step "refactor" {
 1. `execute()` spawns a Claude Code query via the agent SDK `query()` call.
 2. A custom MCP server is injected with a `submit_outcome` tool. The allowed outcome names are passed to the agent in its system context.
 3. The agent works autonomously using its built-in tools to read, edit, and run commands.
-4. Permission requests from the agent are forwarded to Criteria via `sender.permissionRequest()` and resolved when the operator responds.
+4. Permission requests from the agent are forwarded to Criteria via `helpers.permission.request()` and resolved when the operator responds.
 5. When the agent calls `submit_outcome`, the query is interrupted and the workflow transitions to the next state.
 
 ## Session persistence
