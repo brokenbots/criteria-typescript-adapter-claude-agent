@@ -1,0 +1,21 @@
+// Criteria v2 proto custom field options.
+//
+// Extension number 70000 is in the user-defined range (50000–99999), which is
+// guaranteed never to be assigned by the Protobuf project. We claim 70000 for
+// the criteria.sensitive annotation; neighbouring numbers (70001–70099) are
+// reserved for future Criteria field options so forks cannot silently collide.
+syntax = "proto3";
+
+package criteria.v2;
+
+option go_package = "github.com/brokenbots/criteria/proto/criteria/v2;criteriav2";
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.FieldOptions {
+  // sensitive marks a field as carrying secret material.  The host's log
+  // pipeline, the SDK's redaction-aware logger, and reflection-driven
+  // debug/audit code all honor this annotation and either mask or refuse to
+  // serialize the value.
+  bool sensitive = 70000;
+}

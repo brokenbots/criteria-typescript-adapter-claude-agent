@@ -1,5 +1,5 @@
 /**
- * Claude Code Agent Adapter for Criteria
+ * Claude Code Agent Adapter for Criteria (Protocol v2)
  *
  * This adapter controls the actual Claude Code CLI agent (not the Anthropic API)
  * via the @anthropic-ai/claude-agent-sdk. The agent can read files, run commands,
@@ -7,163 +7,107 @@
  *
  * Features:
  * - Spawns real Claude Code CLI subprocess
- * - Bridges permission requests to Criteria's permission system
+ * - Bridges permission requests to Criteria's permission system via helpers.permission
  * - Custom MCP tool `submit_outcome` for workflow integration
  * - Session persistence across execute calls
  * - Structured events for observability
  *
- * Environment Variables:
- * - ANTHROPIC_API_KEY: Required for first-party API access.
- *
- * Example workflow:
- * ```hcl
- * step "refactor" {
- *   adapter = "claude-code"
- *   input {
- *     prompt = "Refactor the auth module to use OAuth2"
- *   }
- *   outcome "success" { transition_to = "test" }
- *   outcome "failure" { transition_to = "review" }
- * }
- * ```
+ * Secrets:
+ * - ANTHROPIC_API_KEY    – Required for first-party API access.
+ * - ANTHROPIC_BASE_URL   – Optional. Override the API base URL.
+ * - ANTHROPIC_AUTH_TOKEN – Optional. Auth token.
  */
 
-import { serve, type EventSender, type ExecuteRequest, type PermitRequest } from '@criteria/adapter-sdk';
-import { query, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
-import type { SDKMessage, Query, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
-import { z } from 'zod';
-
-// ============================================================================
-// Types
-// ============================================================================
-
-interface SessionState {
-  query: Query | null;
-  finalizedOutcome: string | null;
-  finalizedReason: string;
-  claudeSessionId: string | null;
-  lastResultText: string;
-  pendingPermissions: Map<string, { toolUseID: string; resolve: (result: PermissionResult) => void; reject: (reason: Error) => void }>;
-  allowedOutcomes: Set<string>;
-}
+import { serve } from "@criteria/adapter-sdk";
+import { query, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+import type { Helpers, ExecuteRequest } from "@criteria/adapter-sdk";
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const PLUGIN_NAME = 'claude-code';
-const PLUGIN_VERSION = '0.1.0';
+const PLUGIN_NAME = "claude-agent";
+const PLUGIN_VERSION = "2.0.0";
 
-const SUBMIT_OUTCOME_TOOL_NAME = 'submit_outcome';
+const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
 const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
-
-// ============================================================================
-// Sessions
-// ============================================================================
-
-const sessions = new Map<string, SessionState>();
-
-function getSession(sessionId: string): SessionState | undefined {
-  return sessions.get(sessionId);
-}
-
-function createSession(sessionId: string): SessionState {
-  const state: SessionState = {
-    query: null,
-    finalizedOutcome: null,
-    finalizedReason: '',
-    claudeSessionId: null,
-    lastResultText: '',
-    pendingPermissions: new Map(),
-    allowedOutcomes: new Set(),
-  };
-  sessions.set(sessionId, state);
-  return state;
-}
-
-function closeSession(sessionId: string): void {
-  const state = sessions.get(sessionId);
-  if (state?.query) {
-    try {
-      state.query.close();
-    } catch {
-      // ignore
-    }
-  }
-  // Reject any pending permissions so they don't hang
-  for (const { reject } of state?.pendingPermissions.values() || []) {
-    reject(new Error('Session closed'));
-  }
-  sessions.delete(sessionId);
-}
 
 // ============================================================================
 // MCP Server
 // ============================================================================
 
-function buildOutcomeMcpServer(state: SessionState) {
-  const outcomes = Array.from(state.allowedOutcomes);
-  const outcomeSchema = outcomes.length > 0
-    ? z.enum(outcomes as [string, ...string[]]).describe(`The outcome to submit. Must be one of: ${outcomes.join(', ')}`)
-    : z.string().describe('The outcome name to finalize.');
+interface OutcomeCapture {
+  outcome: string | null;
+  reason: string;
+  finalized: boolean;
+}
+
+function buildOutcomeMcpServer(allowedOutcomes: string[], capture: OutcomeCapture) {
+  const outcomeSchema =
+    allowedOutcomes.length > 0
+      ? z
+          .enum(allowedOutcomes as [string, ...string[]])
+          .describe(`The outcome to submit. Must be one of: ${allowedOutcomes.join(", ")}`)
+      : z.string().describe("The outcome name to finalize.");
 
   return createSdkMcpServer({
-    name: 'criteria-workflow',
+    name: "criteria-workflow",
     tools: [
       {
         name: SUBMIT_OUTCOME_TOOL_NAME,
         description: SUBMIT_OUTCOME_DESCRIPTION,
         inputSchema: {
           outcome: outcomeSchema,
-          reason: z.string().optional().describe('Optional reason or explanation for the outcome.'),
+          reason: z.string().optional().describe("Optional reason or explanation for the outcome."),
         },
         annotations: { readOnlyHint: false, destructiveHint: false },
         handler: async (args: any) => {
           const outcome = args.outcome?.trim() as string | undefined;
-          const reason = (args.reason?.trim() as string | undefined) || '';
+          const reason = (args.reason?.trim() as string | undefined) || "";
 
           if (!outcome) {
             return {
-              content: [{ type: 'text', text: 'Outcome is required. Please provide a valid outcome name.' }],
+              content: [{ type: "text", text: "Outcome is required. Please provide a valid outcome name." }],
               isError: true,
             };
           }
 
-          if (!state.allowedOutcomes.has(outcome)) {
-            const allowed = Array.from(state.allowedOutcomes).join(', ');
-            if (state.allowedOutcomes.size === 0) {
+          if (!allowedOutcomes.includes(outcome)) {
+            if (allowedOutcomes.length === 0) {
               return {
-                content: [{ type: 'text', text: 'No outcomes are declared for this step.' }],
+                content: [{ type: "text", text: "No outcomes are declared for this step." }],
                 isError: true,
               };
             }
             return {
-              content: [{ type: 'text', text: `Outcome "${outcome}" is not allowed. Choose one of: ${allowed}` }],
+              content: [
+                {
+                  type: "text",
+                  text: `Outcome "${outcome}" is not allowed. Choose one of: ${allowedOutcomes.join(", ")}`,
+                },
+              ],
               isError: true,
             };
           }
 
-          if (state.finalizedOutcome !== null) {
+          if (capture.finalized) {
             return {
-              content: [{ type: 'text', text: `Outcome already finalized as "${state.finalizedOutcome}".` }],
+              content: [{ type: "text", text: `Outcome already finalized as "${capture.outcome}".` }],
               isError: true,
             };
           }
 
-          state.finalizedOutcome = outcome;
-          state.finalizedReason = reason;
-
-          // Interrupt the agent so the workflow can proceed
-          if (state.query) {
-            try {
-              await state.query.interrupt();
-            } catch {
-              // ignore interrupt errors
-            }
-          }
+          capture.outcome = outcome;
+          capture.reason = reason;
+          capture.finalized = true;
 
           return {
-            content: [{ type: 'text', text: `Outcome "${outcome}" recorded successfully. Workflow will proceed.` }],
+            content: [
+              { type: "text", text: `Outcome "${outcome}" recorded successfully. Workflow will proceed.` },
+            ],
+            metadata: { outcome, reason },
           };
         },
       },
@@ -175,7 +119,7 @@ function buildOutcomeMcpServer(state: SessionState) {
 // Permission Bridge
 // ============================================================================
 
-function buildCanUseTool(state: SessionState, sender: EventSender) {
+function buildCanUseTool(helpers: Helpers) {
   return async (
     toolName: string,
     input: Record<string, unknown>,
@@ -187,41 +131,15 @@ function buildCanUseTool(state: SessionState, sender: EventSender) {
       toolUseID: string;
     }
   ): Promise<PermissionResult> => {
-    const details: Record<string, string> = {
-      tool: toolName,
-      toolUseId: options.toolUseID,
-    };
-    if (options.title) details.title = options.title;
-    if (options.displayName) details.displayName = options.displayName;
-    if (options.description) details.description = options.description;
-    try {
-      details.input = JSON.stringify(input).slice(0, 4000);
-    } catch {
-      details.input = '<unserializable>';
+    const decision = await helpers.permission.request({ tool: toolName, args: input });
+    if (decision.decision === "allow") {
+      return { behavior: "allow", toolUseID: options.toolUseID };
     }
-
-    const permissionId = await sender.permissionRequest(toolName, details);
-
-    return new Promise<PermissionResult>((resolve) => {
-      const timeout = setTimeout(() => {
-        state.pendingPermissions.delete(permissionId);
-        resolve({ behavior: 'deny', message: 'Permission request timed out.', toolUseID: options.toolUseID });
-      }, 300_000); // 5 minute timeout
-
-      state.pendingPermissions.set(permissionId, {
-        toolUseID: options.toolUseID,
-        resolve: (result) => {
-          clearTimeout(timeout);
-          state.pendingPermissions.delete(permissionId);
-          resolve(result);
-        },
-        reject: (reason) => {
-          clearTimeout(timeout);
-          state.pendingPermissions.delete(permissionId);
-          resolve({ behavior: 'deny', message: reason.message, toolUseID: options.toolUseID });
-        },
-      });
-    });
+    return {
+      behavior: "deny",
+      message: decision.reason || "Denied by host",
+      toolUseID: options.toolUseID,
+    };
   };
 }
 
@@ -230,71 +148,80 @@ function buildCanUseTool(state: SessionState, sender: EventSender) {
 // ============================================================================
 
 async function handleMessageStream(
-  state: SessionState,
-  sender: EventSender,
-  q: Query
+  helpers: Helpers,
+  q: Query,
+  state: {
+    finalizedOutcome: string | null;
+    finalizedReason: string;
+    lastResultText: string;
+    claudeSessionId: string | null;
+  }
 ): Promise<void> {
   for await (const msg of q) {
-    // Capture session id from any message for resume on next execute
-    if ('session_id' in msg && msg.session_id) {
-      state.claudeSessionId = msg.session_id;
+    if ("session_id" in msg && (msg as any).session_id) {
+      state.claudeSessionId = (msg as any).session_id as string;
     }
 
     switch (msg.type) {
-      case 'assistant': {
+      case "assistant": {
         const content = msg.message.content;
         if (Array.isArray(content)) {
           for (const block of content) {
-            if (block.type === 'text' && block.text) {
-              await sender.log('stdout', block.text);
-              await sender.adapterEvent('agent.message', { content: block.text });
+            if (block.type === "text" && block.text) {
+              await helpers.log.stdout(block.text);
+              await helpers.log.adapterEvent("agent.message", { content: block.text });
             }
           }
         }
         break;
       }
 
-      case 'stream_event': {
-        // Partial assistant message during streaming
-        if (msg.event && msg.event.type === 'content_block_delta') {
+      case "stream_event": {
+        if (msg.event && msg.event.type === "content_block_delta") {
           const delta = (msg.event as any).delta;
-          if (delta?.type === 'text_delta' && delta.text) {
-            await sender.log('stdout', delta.text);
+          if (delta?.type === "text_delta" && delta.text) {
+            await helpers.log.stdout(delta.text);
           }
         }
         break;
       }
 
-      case 'tool_progress': {
+      case "tool_progress": {
         const progressMsg = (msg as any).message || `${msg.tool_name} running...`;
-        await sender.log('stdout', `[${msg.tool_name}] ${progressMsg}\n`);
-        await sender.adapterEvent('tool.progress', { tool: msg.tool_name, message: progressMsg });
+        await helpers.log.stdout(`[${msg.tool_name}] ${progressMsg}\n`);
+        await helpers.log.adapterEvent("tool.progress", { tool: msg.tool_name, message: progressMsg });
         break;
       }
 
-      case 'system': {
+      case "system": {
         break;
       }
 
-      case 'result': {
-        // Final result message — log the agent's full text output
-        if (msg.subtype === 'success') {
+      case "result": {
+        if (msg.subtype === "success") {
           if (msg.result) {
             state.lastResultText = msg.result;
-            await sender.log('stdout', msg.result + '\n');
+            await helpers.log.stdout(msg.result + "\n");
           }
-          await sender.adapterEvent('query.complete', { durationMs: msg.duration_ms, turns: msg.num_turns, costUsd: msg.total_cost_usd });
+          await helpers.log.adapterEvent("query.complete", {
+            durationMs: msg.duration_ms,
+            turns: msg.num_turns,
+            costUsd: msg.total_cost_usd,
+          });
         } else {
-          const errorText = (msg as any).errors?.join('\n') || `Query error: ${msg.subtype}`;
-          await sender.log('stderr', `[claude-code] ${errorText}\n`);
-          await sender.adapterEvent('query.error', { subtype: msg.subtype, errors: (msg as any).errors || [] });
+          const errorText = (msg as any).errors?.join("\n") || `Query error: ${msg.subtype}`;
+          await helpers.log.stderr(`[claude-agent] ${errorText}\n`);
+          await helpers.log.adapterEvent("query.error", {
+            subtype: msg.subtype,
+            errors: (msg as any).errors || [],
+          });
         }
         break;
       }
 
-      case 'auth_status': {
+      case "auth_status": {
         if (msg.isAuthenticating) {
-          await sender.log('stdout', '[claude-code] Authenticating...\n');
+          await helpers.log.stdout("[claude-agent] Authenticating...\n");
         }
         break;
       }
@@ -309,89 +236,91 @@ async function handleMessageStream(
 // Execute Logic
 // ============================================================================
 
-async function executeStep(state: SessionState, req: ExecuteRequest, sender: EventSender): Promise<void> {
-  const prompt = req.config.prompt;
+async function executeStep(
+  req: ExecuteRequest,
+  helpers: Helpers
+): Promise<void> {
+  const prompt = req.input.prompt;
   if (!prompt) {
-    throw new Error('config.prompt is required');
+    throw new Error("input.prompt is required");
   }
 
   // Reset per-execution state
-  state.finalizedOutcome = null;
-  state.finalizedReason = '';
-  state.lastResultText = '';
-  state.allowedOutcomes = new Set(req.allowedOutcomes);
+  let finalizedOutcome: string | null = null;
+  let finalizedReason = "";
+  let lastResultText = "";
+  let claudeSessionId = helpers.session.get<string | null>("claudeSessionId") ?? null;
 
-  // Build system prompt append — outcome instructions always included;
-  // user-configured system_prompt appended after.
-  const outcomeInstructions = req.allowedOutcomes.length > 0
-    ? `You are integrated into a workflow system. When you have completed your task, you MUST call the \`${SUBMIT_OUTCOME_TOOL_NAME}\` tool to finalize the step. The allowed outcomes are: ${req.allowedOutcomes.join(', ')}. Do not stop or explain that you are done — just call the tool.`
-    : `You are integrated into a workflow system.`;
+  const allowedOutcomes = req.allowedOutcomes ?? [];
+  const outcomeInstructions =
+    allowedOutcomes.length > 0
+      ? `You are integrated into a workflow system. When you have completed your task, you MUST call the \`${SUBMIT_OUTCOME_TOOL_NAME}\` tool to finalize the step. The allowed outcomes are: ${allowedOutcomes.join(", ")}. Do not stop or explain that you are done — just call the tool.`
+      : `You are integrated into a workflow system.`;
 
-  const systemPromptAppend = req.config.system_prompt
-    ? `${outcomeInstructions}\n\n${req.config.system_prompt}`
-    : outcomeInstructions;
+  const systemPromptAppend = helpers.session.get<string>("systemPromptAppend") ?? outcomeInstructions;
 
-  await sender.log('stdout', `[claude-code] Starting agent query...\n`);
+  await helpers.log.stdout("[claude-agent] Starting agent query...\n");
 
-  const mcpServer = buildOutcomeMcpServer(state);
+  const capture: OutcomeCapture = { outcome: null, reason: "", finalized: false };
+  const mcpServer = buildOutcomeMcpServer(allowedOutcomes, capture);
   const abortController = new AbortController();
+
+  const cwd = helpers.session.get<string>("cwd") ?? process.cwd();
+  const model = helpers.session.get<string>("model") ?? undefined;
+  const thinking = helpers.session.get<boolean>("thinking") ?? false;
+
+  const apiKey = (await helpers.secrets.get("ANTHROPIC_API_KEY")) ?? undefined;
+  const baseURL = (await helpers.secrets.get("ANTHROPIC_BASE_URL")) ?? undefined;
+  const authToken = (await helpers.secrets.get("ANTHROPIC_AUTH_TOKEN")) ?? undefined;
 
   const q = query({
     prompt,
     options: {
       abortController,
-      systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPromptAppend },
-      cwd: req.config.cwd || process.cwd(),
-      canUseTool: buildCanUseTool(state, sender),
-      // Auto-allow the submit_outcome MCP tool so it bypasses the permission system
+      systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend },
+      cwd,
+      canUseTool: buildCanUseTool(helpers),
       allowedTools: [`mcp__${mcpServer.name}__${SUBMIT_OUTCOME_TOOL_NAME}`],
-      tools: { type: 'preset', preset: 'claude_code' },
-      // Pass MCP server inline so it's available from the first turn
+      tools: { type: "preset", preset: "claude_code" },
       mcpServers: { [mcpServer.name]: mcpServer },
-      // Only persist/resume a session if we have an explicit ID from a prior turn.
-      // Without this guard, the claude CLI auto-resumes its last on-disk session
-      // which can inject unrelated conversation context into the new step.
-      persistSession: state.claudeSessionId !== null,
-      resume: state.claudeSessionId || undefined,
-      model: req.config.model || undefined,
-      thinking: req.config.thinking === 'true'
-        ? { type: 'adaptive' }
-        : undefined,
+      persistSession: claudeSessionId !== null,
+      resume: claudeSessionId || undefined,
+      model,
+      thinking: thinking ? { type: "adaptive" } : undefined,
       env: {
         ...process.env,
-        CLAUDE_AGENT_SDK_CLIENT_APP: 'criteria-adapter-claude-code/0.1.0',
-        ...(req.config.auth_token ? { ANTHROPIC_AUTH_TOKEN: req.config.auth_token } : {}),
-        ...(req.config.api_key ? { ANTHROPIC_API_KEY: req.config.api_key } : {}),
-        ...(req.config.base_url ? { ANTHROPIC_BASE_URL: req.config.base_url } : {}),
+        CLAUDE_AGENT_SDK_CLIENT_APP: "criteria-adapter-claude-agent/2.0.0",
+        ...(apiKey ? { ANTHROPIC_API_KEY: apiKey } : {}),
+        ...(baseURL ? { ANTHROPIC_BASE_URL: baseURL } : {}),
+        ...(authToken ? { ANTHROPIC_AUTH_TOKEN: authToken } : {}),
       },
     },
   });
 
-  state.query = q;
+  const state = { finalizedOutcome, finalizedReason, lastResultText, claudeSessionId };
 
   try {
-    await handleMessageStream(state, sender, q);
+    await handleMessageStream(helpers, q, state);
   } catch (e) {
-    await sender.log('stderr', `[claude-code] Query error: ${e}\n`);
+    await helpers.log.stderr(`[claude-agent] Query error: ${e}\n`);
   } finally {
-    state.query = null;
+    // Persist session ID for resume
+    helpers.session.set("claudeSessionId", state.claudeSessionId);
+    helpers.session.set("lastResultText", state.lastResultText);
   }
 
-  // Determine outcome
-  if (state.finalizedOutcome) {
-    await sender.result(state.finalizedOutcome, {
-      reason: state.finalizedReason,
-      ...(state.lastResultText ? { output: state.lastResultText } : {}),
-    });
+  // Determine outcome from capture
+  if (capture.outcome) {
+    await helpers.outcomes.finalize(capture.outcome, { reason: capture.reason });
     return;
   }
 
   // No outcome was submitted
-  if (state.allowedOutcomes.has('needs_review')) {
-    await sender.result('needs_review', { reason: 'Agent completed without submitting an outcome' });
+  if (allowedOutcomes.includes("needs_review")) {
+    await helpers.outcomes.finalize("needs_review", { reason: "Agent completed without submitting an outcome" });
   } else {
-    await sender.adapterEvent('outcome.failure', { reason: 'missing submit_outcome' });
-    await sender.result('failure', { reason: 'Agent completed without submitting an outcome' });
+    await helpers.log.adapterEvent("outcome.failure", { reason: "missing submit_outcome" });
+    await helpers.outcomes.finalize("failure", { reason: "Agent completed without submitting an outcome" });
   }
 }
 
@@ -399,61 +328,84 @@ async function executeStep(state: SessionState, req: ExecuteRequest, sender: Eve
 // Main
 // ============================================================================
 
-serve({
+export const adapterConfig = {
   name: PLUGIN_NAME,
   version: PLUGIN_VERSION,
-  capabilities: ['multi_turn', 'structured_events', 'tool_calling'],
+  description: "Claude Code agent adapter for Criteria workflows.",
 
-  configSchema: {
+  secrets: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
+
+  permissions: [
+    { name: "read_file" },
+    { name: "write_file" },
+    { name: "edit_file" },
+    { name: "run_command" },
+    { name: "list_directory" },
+  ],
+
+  config_schema: {
     fields: {
-      model: { type: 'string', required: false, doc: 'Model to use (e.g., claude-sonnet-4-6)' },
-      cwd: { type: 'string', required: false, doc: 'Working directory for the agent. Defaults to process.cwd().' },
-      system_prompt: { type: 'string', required: false, doc: 'Custom system prompt prepended to every execute call' },
-      thinking: { type: 'bool', required: false, doc: 'Enable adaptive thinking mode' },
-      auth_token: { type: 'string', required: false, doc: 'Value for ANTHROPIC_AUTH_TOKEN' },
-      api_key: { type: 'string', required: false, doc: 'Value for ANTHROPIC_API_KEY' },
-      base_url: { type: 'string', required: false, doc: 'Value for ANTHROPIC_BASE_URL' },
+      model: { type: "string", required: false, description: "Model to use (e.g., claude-sonnet-4-6)" },
+      cwd: { type: "string", required: false, description: "Working directory for the agent. Defaults to process.cwd()." },
+      system_prompt: { type: "string", required: false, description: "Custom system prompt prepended to every execute call" },
+      thinking: { type: "bool", required: false, description: "Enable adaptive thinking mode" },
     },
   },
 
-  inputSchema: {
+  input_schema: {
     fields: {
-      prompt: { type: 'string', required: true, doc: 'The task prompt to send to Claude Code' },
-      model: { type: 'string', required: false, doc: 'Per-step model override' },
+      prompt: { type: "string", required: true, description: "The task prompt to send to Claude Code" },
+      model: { type: "string", required: false, description: "Per-step model override" },
     },
   },
 
-  async onOpenSession(req) {
-    createSession(req.sessionId);
+  async openSession(req: any, helpers: Helpers) {
+    // Store adapter-level config in session
+    helpers.session.set("model", req.config.model || undefined);
+    helpers.session.set("cwd", req.config.cwd || undefined);
+    helpers.session.set("thinking", req.config.thinking === "true" || undefined);
+    helpers.session.set(
+      "systemPromptAppend",
+      req.config.system_prompt
+        ? `${req.config.system_prompt}`
+        : undefined
+    );
+    helpers.session.set("claudeSessionId", null);
+    helpers.session.set("lastResultText", "");
   },
 
-  async execute(req, sender) {
-    const state = getSession(req.sessionId);
-    if (!state) {
-      throw new Error(`Unknown session: ${req.sessionId}`);
-    }
-    await executeStep(state, req, sender);
+  async execute(req: any, helpers: Helpers) {
+    await executeStep(req, helpers);
   },
 
-  async onPermit(req) {
-    const state = getSession(req.sessionId);
-    if (!state) return;
-
-    const pending = state.pendingPermissions.get(req.permissionId);
-    if (!pending) return;
-
-    if (req.allow) {
-      pending.resolve({ behavior: 'allow', toolUseID: pending.toolUseID });
-    } else {
-      pending.resolve({
-        behavior: 'deny',
-        message: req.reason || 'Denied by user',
-        toolUseID: pending.toolUseID,
-      });
-    }
+  async snapshot(_sessionId: string, helpers: Helpers) {
+    const payload = {
+      claudeSessionId: helpers.session.get<string | null>("claudeSessionId") ?? null,
+      lastResultText: helpers.session.get<string>("lastResultText") ?? "",
+      model: helpers.session.get<string>("model") ?? undefined,
+      cwd: helpers.session.get<string>("cwd") ?? undefined,
+      thinking: helpers.session.get<boolean>("thinking") ?? undefined,
+      systemPromptAppend: helpers.session.get<string>("systemPromptAppend") ?? undefined,
+    };
+    const state = new TextEncoder().encode(JSON.stringify(payload));
+    return { state, schemaVersion: 1 };
   },
 
-  async onCloseSession(req) {
-    closeSession(req.sessionId);
+  async restore(_sessionId: string, blob: { state: Uint8Array; schemaVersion?: number }, helpers: Helpers) {
+    const text = new TextDecoder().decode(blob.state);
+    const snapshot = JSON.parse(text) as Record<string, unknown>;
+    helpers.session.set("claudeSessionId", (snapshot.claudeSessionId as string | null) ?? null);
+    helpers.session.set("lastResultText", (snapshot.lastResultText as string) ?? "");
+    helpers.session.set("model", snapshot.model as string | undefined);
+    helpers.session.set("cwd", snapshot.cwd as string | undefined);
+    helpers.session.set("thinking", snapshot.thinking as boolean | undefined);
+    helpers.session.set("systemPromptAppend", snapshot.systemPromptAppend as string | undefined);
   },
-});
+};
+
+// Only start the server when this file is the main entry point
+if (import.meta.url === `file://${process.argv[1]}`) {
+  serve(adapterConfig);
+}
+
+export default adapterConfig;

@@ -1,6 +1,6 @@
 {
-  "name": "criteria-adapter-claude-code-example",
-  "version": "0.1.0",
+  "name": "criteria-adapter-claude-agent",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "build": "bun build --compile index.ts --outfile bin/criteria-adapter-claude-agent",
@@ -8,10 +8,11 @@
     "build:linux-arm64": "bun build --compile --target=bun-linux-arm64 index.ts --outfile bin/criteria-adapter-claude-agent",
     "build:darwin-arm64": "bun build --compile --target=bun-darwin-arm64 index.ts --outfile bin/criteria-adapter-claude-agent",
     "binary:install": "cp bin/criteria-adapter-claude-agent ${HOME}/.criteria/plugins/",
+    "test": "bun test",
     "clean": "rm -f bin/criteria-adapter-claude-agent"
   },
   "dependencies": {
-    "@criteria/adapter-sdk": "github:brokenbots/criteria-typescript-adapter-sdk",
+    "@criteria/adapter-sdk": "file:../criteria-typescript-adapter-sdk",
     "@anthropic-ai/claude-agent-sdk": "^0.2.128",
     "zod": "^4.0.0"
   },

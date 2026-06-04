@@ -1,0 +1,368 @@
+// Criteria Adapter Protocol v2.
+//
+// WS03 cutover: criteria/v1/adapter_plugin.proto was deleted; this file is
+// now the sole wire contract for all adapter binaries (copilot, mcp, noop,
+// shell-builtin, and third-party adapters). Any adapter previously built
+// against v1 must be recompiled against these bindings.
+//
+// The Permissions RPC is a bidirectional stream: the HOST (gRPC client) sends
+// PermissionEvent messages (request=allow, cancel=deny) and the ADAPTER (gRPC
+// server) sends PermissionDecision acknowledgments back. Adapters that embed
+// sdk/adapterhost.UnimplementedPermissions receive post-hoc enforcement
+// (outcome override to needs_review on denial); adapters that implement
+// Permissions themselves (e.g. copilot) get blocking enforcement so the tool
+// never runs when denied.
+//
+// See docs/adapters.md for the feature roadmap and well-known event_kind registry.
+syntax = "proto3";
+
+package criteria.v2;
+
+option go_package = "github.com/brokenbots/criteria/proto/criteria/v2;criteriav2";
+
+import "criteria/v2/options.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// AdapterService is the out-of-process adapter contract for Criteria v2.
+service AdapterService {
+  rpc Info(InfoRequest)                          returns (InfoResponse);
+  rpc OpenSession(OpenSessionRequest)            returns (OpenSessionResponse);
+  rpc Execute(ExecuteRequest)                    returns (stream ExecuteEvent);
+  rpc Log(LogRequest)                            returns (stream LogEvent);
+  rpc Permissions(stream PermissionEvent)        returns (stream PermissionDecision);
+  rpc Pause(PauseRequest)                        returns (PauseResponse);
+  rpc Resume(ResumeRequest)                      returns (ResumeResponse);
+  rpc Snapshot(SnapshotRequest)                  returns (SnapshotResponse);
+  rpc Restore(RestoreRequest)                    returns (RestoreResponse);
+  rpc Inspect(InspectRequest)                    returns (InspectResponse);
+  rpc CloseSession(CloseSessionRequest)          returns (CloseSessionResponse);
+}
+
+// ─── Chunked framing ────────────────────────────────────────────────────────
+
+// Chunk is the framing envelope for large payload fields on server-streaming
+// RPCs (Execute, Log).  Within WS02, chunking applies only to
+// AdapterEvent.payload_json, LogEvent.line, and ExecuteResult.outputs_json.
+// seq is zero-based; final is true on the last chunk.
+//
+// When chunk is non-nil on a payload-bearing message, the typed payload field
+// (payload, outputs) is nil; the raw bytes are carried in the corresponding
+// *_json field instead.  Receivers concatenate *_json bytes in seq order and
+// then unmarshal the result back to the typed form.
+message Chunk {
+  uint32 seq   = 1;
+  uint32 total = 2;
+  bool   final = 3;
+  reserved 100 to 999;
+}
+
+// ─── Heartbeat ──────────────────────────────────────────────────────────────
+
+// Heartbeat is sent on every server-stream when no other traffic is flowing.
+// Server streams send one every 30 s; two missed heartbeats (~60 s) trigger
+// the crash-recovery policy.  SDKs provide a heartbeat helper so adapter
+// authors do not need to manage timers.
+message Heartbeat {
+  string                    stream_name = 1;
+  google.protobuf.Timestamp sent_at     = 2;
+  reserved 100 to 999;
+}
+
+// ─── Schema types ───────────────────────────────────────────────────────────
+
+// ConfigFieldProto describes a single field in an adapter schema.
+message ConfigFieldProto {
+  string type        = 1;  // "string" | "number" | "bool" | "boolean" (alias for "bool") | "list_string"
+  bool   required    = 2;
+  string description = 3;
+  string default_str = 4;
+  bool   sensitive   = 5;  // marks the field as a taint-source for downstream tools
+  reserved 100 to 999;
+}
+
+// AdapterSchemaProto holds a named set of config/input/output fields.
+message AdapterSchemaProto {
+  map<string, ConfigFieldProto> fields = 1;
+  reserved 100 to 999;
+}
+
+// ─── Info ────────────────────────────────────────────────────────────────────
+
+message InfoRequest {
+  reserved 100 to 999;
+}
+
+message InfoResponse {
+  string name                           = 1;
+  string version                        = 2;
+  string description                    = 3;
+  repeated string capabilities          = 4;
+  repeated string platforms             = 5;
+  string sdk_protocol_version           = 6;
+  string source_url                     = 7;
+  AdapterSchemaProto config_schema      = 8;
+  AdapterSchemaProto input_schema       = 9;
+  AdapterSchemaProto output_schema      = 10;  // NEW v2: schema for step outputs
+  map<string, string> secrets           = 11;  // declared secret names → descriptions
+  repeated string permissions           = 12;
+  repeated string compatible_environments = 13;
+  string container_image                = 14;
+  // supported_features lists optional capabilities this adapter implements.
+  // Well-known values: "pause", "resume", "snapshot", "restore", "inspect".
+  // The host gates UI and behavior on this list; unknown values are ignored
+  // for forward-compatibility.  Empty = none of the optional features.
+  repeated string supported_features    = 15;  // NEW v2 (D76)
+  // max_chunk_bytes is the maximum payload the adapter accepts in a single
+  // message field before requiring chunked framing.  0 = use default (4 MiB).
+  // The host uses min(host_max, adapter_max) when chunking outbound payloads.
+  uint32 max_chunk_bytes                = 16;  // NEW v2 (D78)
+  reserved 100 to 999;
+}
+
+// ─── Session lifecycle ───────────────────────────────────────────────────────
+
+message OpenSessionRequest {
+  string              session_id       = 1;
+  map<string, string> config           = 2;
+  // secrets carries secret values for this session.  Redaction-aware log
+  // pipelines MUST mask or refuse to log any field annotated sensitive.
+  map<string, string> secrets          = 3 [(criteria.v2.sensitive) = true];
+  repeated string     allowed_outcomes = 4;
+  // field 7 is reserved for environment_context (deferred to WS09 — the
+  // environment block grammar is not yet locked).  Adapters that need
+  // environment-derived context in v2 read it from the config map.
+  reserved 7;
+  reserved "environment_context";
+  reserved 100 to 999;
+}
+
+message OpenSessionResponse {
+  reserved 100 to 999;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+  reserved 100 to 999;
+}
+
+message CloseSessionResponse {
+  reserved 100 to 999;
+}
+
+// ─── Execute ─────────────────────────────────────────────────────────────────
+
+message ExecuteRequest {
+  string              session_id       = 1;
+  string              step_name        = 2;
+  map<string, string> input            = 3;
+  map<string, string> secret_inputs    = 4 [(criteria.v2.sensitive) = true];
+  repeated string     allowed_outcomes = 5;
+  reserved 100 to 999;
+}
+
+// AdapterEvent is a typed semantic event emitted by the adapter.
+// event_kind is a dot-separated identifier; well-known values are registered
+// in docs/adapters.md (WS39).  Unknown kinds are forwarded unchanged.
+//
+// Chunked encoding: when chunk is non-nil, payload is nil and payload_json
+// carries the raw JSON bytes of this fragment.  Reassemble payload_json bytes
+// in Chunk.seq order and unmarshal the result to google.protobuf.Struct.
+message AdapterEvent {
+  string                    event_kind   = 1;
+  // payload is set when chunk == nil (non-chunked or single-message payload).
+  google.protobuf.Struct    payload      = 2;
+  google.protobuf.Timestamp emitted_at   = 3;
+  Chunk                     chunk        = 4;
+  // payload_json carries the JSON-encoded bytes of a payload fragment when
+  // chunk is non-nil.  Collect all fragments in Chunk.seq order, concatenate,
+  // then unmarshal to google.protobuf.Struct.
+  bytes                     payload_json = 5;
+  reserved 100 to 999;
+}
+
+// ToolInvocation is emitted when the adapter invokes an external tool.
+message ToolInvocation {
+  string                    tool_name   = 1;
+  google.protobuf.Struct    args        = 2;
+  google.protobuf.Timestamp invoked_at  = 3;
+  reserved 100 to 999;
+}
+
+message ExecuteResult {
+  string              outcome      = 1;
+  // outputs is set when chunk == nil (non-chunked or single-message payload).
+  map<string, string> outputs      = 2;
+  Chunk               chunk        = 3;
+  // outputs_json carries the JSON-encoded bytes of an outputs map fragment when
+  // chunk is non-nil.  Collect all fragments in Chunk.seq order, concatenate,
+  // then unmarshal to map<string,string>.
+  bytes               outputs_json = 4;
+  reserved 100 to 999;
+}
+
+// ExecuteEvent is the stream message for the Execute RPC.
+// Log lines are NOT included here; they flow through the Log RPC.
+message ExecuteEvent {
+  oneof event {
+    AdapterEvent    adapter   = 1;
+    ToolInvocation  tool      = 2;
+    ExecuteResult   result    = 3;
+    Heartbeat       heartbeat = 4;
+  }
+  reserved 100 to 999;
+}
+
+// ─── Log ─────────────────────────────────────────────────────────────────────
+
+message LogRequest {
+  string session_id = 1;
+  string step_name  = 2;
+  reserved 100 to 999;
+}
+
+// LogEvent is the stream message for the Log RPC.
+//
+// stream_name must match ^[a-z][a-z0-9_-]{0,31}$.
+// Well-known values: "stdout", "stderr", "agent".
+// Extensions like "tool", "trace", "metric" are accepted without a proto bump.
+// chunk is non-nil when this message carries a partial payload; all chunks for
+// a given stream_name must be reassembled in seq order before consuming line.
+// line is raw bytes so it is safe to split at any byte boundary without
+// breaking UTF-8; callers that need a string must decode after reassembly.
+message LogEvent {
+  string                    session_id  = 1;
+  string                    step_name   = 2;
+  string                    stream_name = 3;
+  bytes                     line        = 4;
+  google.protobuf.Timestamp timestamp   = 5;
+  Heartbeat                 heartbeat   = 6;
+  Chunk                     chunk       = 7;
+  reserved 100 to 999;
+}
+
+// ─── Permissions ─────────────────────────────────────────────────────────────
+
+// PermissionRequest is sent by the adapter to request permission for a tool call.
+// args_digest = sha256(canonical_json(args)) per the JCS / RFC 8785 algorithm
+// (see internal/adapter/audit/canonical.go).
+message PermissionRequest {
+  string request_id   = 1;
+  string tool         = 2;
+  string args_digest  = 3;  // sha256(canonical_json(args))
+  string args_preview = 4;
+  // field 5 is reserved for full args (google.protobuf.Struct args).
+  // Adding arg-aware policy (D83) without breaking the v2 wire.
+  reserved 5;
+  reserved "args";
+  reserved 100 to 999;
+}
+
+// PermissionCancel carries a deny decision from the HOST to the ADAPTER on the
+// Permissions stream. When the host denies a tool request, it sends a
+// PermissionEvent with cancel set; the adapter unblocks the pending request
+// and returns Denied to the Copilot SDK so the tool does not run.
+// reason is optional human-readable text (e.g. "no matching allow_tools entry").
+message PermissionCancel {
+  string request_id = 1;
+  string reason     = 2;
+  reserved 100 to 999;
+}
+
+// PermissionEvent is the client-to-server message on the Permissions stream.
+message PermissionEvent {
+  oneof event {
+    PermissionRequest request = 1;
+    PermissionCancel  cancel  = 2;
+  }
+  reserved 100 to 999;
+}
+
+// PermissionDecision is the server-to-client message on the Permissions stream.
+// The host answers requests in any order; multiple requests may be in flight.
+// heartbeat is non-nil when this message is a liveness ping with no decision.
+message PermissionDecision {
+  string    request_id = 1;
+  string    decision   = 2;  // "allow" | "deny"
+  string    reason     = 3;
+  Heartbeat heartbeat  = 4;
+  reserved 100 to 999;
+}
+
+// ─── Lifecycle: Pause / Resume ───────────────────────────────────────────────
+
+message PauseRequest {
+  string session_id = 1;
+  reserved 100 to 999;
+}
+
+message PauseResponse {
+  reserved 100 to 999;
+}
+
+message ResumeRequest {
+  string session_id = 1;
+  reserved 100 to 999;
+}
+
+message ResumeResponse {
+  reserved 100 to 999;
+}
+
+// ─── Lifecycle: Snapshot / Restore ──────────────────────────────────────────
+
+message SnapshotRequest {
+  string session_id = 1;
+  reserved 100 to 999;
+}
+
+message SnapshotResponse {
+  bytes  state          = 1 [(criteria.v2.sensitive) = true];
+  uint32 schema_version = 2;
+  reserved 100 to 999;
+}
+
+message RestoreRequest {
+  string session_id     = 1;
+  bytes  state          = 2 [(criteria.v2.sensitive) = true];
+  uint32 schema_version = 3;
+  reserved 100 to 999;
+}
+
+message RestoreResponse {
+  reserved 100 to 999;
+}
+
+// SnapshotVersionMismatch is returned as a gRPC/Connect error detail when a
+// Restore request specifies a schema_version the adapter cannot read.
+// The host surfaces this as: "snapshot taken at v<have>, adapter speaks v<want>
+// only — refusing to restore".
+message SnapshotVersionMismatch {
+  uint32 have = 1;  // schema_version from the RestoreRequest
+  uint32 want = 2;  // schema_version this adapter can handle
+  reserved 100 to 999;
+}
+
+// ─── Lifecycle: Inspect ──────────────────────────────────────────────────────
+
+message InspectRequest {
+  string session_id = 1;
+  reserved 100 to 999;
+}
+
+// InspectField is an adapter-defined structured field for operator UIs.
+message InspectField {
+  string               key   = 1;
+  string               label = 2;  // human-friendly label for UIs
+  google.protobuf.Value value = 3;
+  reserved 100 to 999;
+}
+
+message InspectResponse {
+  string                    current_step              = 1;
+  uint32                    pending_permission_count  = 2;
+  google.protobuf.Timestamp last_activity_at          = 3;
+  repeated InspectField     fields                    = 4;
+  google.protobuf.Struct    extra                     = 5;  // freeform escape hatch
+  reserved 100 to 999;
+}
