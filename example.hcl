@@ -1,42 +1,45 @@
-# Example Criteria workflow using the claude-code adapter
+# Example Criteria workflow using the claude-agent adapter (Protocol v2)
 # This controls the actual Claude Code CLI agent (not the Anthropic API SDK)
 
-step "analyze" {
-  adapter = "claude-code"
+adapter "claude-agent" "claude" {
   config {
     model = "claude-sonnet-4-6"
   }
+}
+
+step "analyze" {
+  target = adapter.claude-agent.claude
   input {
     prompt = "Analyze this codebase for security issues and report your findings"
   }
-  outcome "clean"    { transition_to = "deploy" }
-  outcome "issues_found" { transition_to = "review" }
-  outcome "failure"  { transition_to = "failed" }
+  outcome "clean"        { next = "deploy" }
+  outcome "issues_found" { next = "review" }
+  outcome "failure"      { next = "failed" }
 }
 
 step "review" {
-  adapter = "claude-code"
+  target = adapter.claude-agent.claude
   input {
     prompt = "Review the previous analysis and create a detailed remediation plan"
   }
-  outcome "approved" { transition_to = "fix" }
-  outcome "rejected" { transition_to = "failed" }
+  outcome "approved" { next = "fix" }
+  outcome "rejected" { next = "failed" }
 }
 
 step "fix" {
-  adapter = "claude-code"
+  target = adapter.claude-agent.claude
   input {
     prompt = "Apply the approved remediation plan to the codebase"
   }
-  outcome "success" { transition_to = "deploy" }
-  outcome "failure" { transition_to = "failed" }
+  outcome "success" { next = "deploy" }
+  outcome "failure" { next = "failed" }
 }
 
 step "deploy" {
-  adapter = "claude-code"
+  target = adapter.claude-agent.claude
   input {
     prompt = "Run the deployment tests and verify everything passes"
   }
-  outcome "success" { transition_to = "done" }
-  outcome "failure" { transition_to = "failed" }
+  outcome "success" { next = "done" }
+  outcome "failure" { next = "failed" }
 }
