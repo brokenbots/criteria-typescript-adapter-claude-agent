@@ -370,7 +370,7 @@ export const adapterConfig = {
     // Store adapter-level config in session
     helpers.session.set("model", req.config.model || undefined);
     helpers.session.set("cwd", req.config.cwd || undefined);
-    helpers.session.set("thinking", req.config.thinking === "true" || undefined);
+    helpers.session.set("thinking", req.config.thinking === true || req.config.thinking === "true" || undefined);
     helpers.session.set(
       "systemPromptAppend",
       req.config.system_prompt
