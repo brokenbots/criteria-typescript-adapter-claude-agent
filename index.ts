@@ -288,7 +288,6 @@ async function executeStep(
       model,
       thinking: thinking ? { type: "adaptive" } : undefined,
       env: {
-        ...process.env,
         CLAUDE_AGENT_SDK_CLIENT_APP: "criteria-adapter-claude-agent/2.0.0",
         ...(apiKey ? { ANTHROPIC_API_KEY: apiKey } : {}),
         ...(baseURL ? { ANTHROPIC_BASE_URL: baseURL } : {}),
@@ -333,7 +332,15 @@ export const adapterConfig = {
   version: PLUGIN_VERSION,
   description: "Claude Code agent adapter for Criteria workflows.",
 
-  secrets: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
+  source_url: "https://github.com/criteria-adapters/claude-agent",
+  capabilities: ["multi_turn", "tool_calling", "structured_events"],
+  platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
+
+  secrets: [
+    { name: "ANTHROPIC_API_KEY", required: true, description: "Anthropic API key" },
+    { name: "ANTHROPIC_BASE_URL", required: false, description: "Override base URL" },
+    { name: "ANTHROPIC_AUTH_TOKEN", required: false, description: "Auth token" },
+  ],
 
   permissions: [
     { name: "read_file" },
