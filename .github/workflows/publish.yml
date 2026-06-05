@@ -1,23 +1,70 @@
 name: Publish Adapter
 
+# Build the adapter (toolchain-specific), then publish the binary via the
+# reusable brokenbots/publish-adapter action. The SDK is a file: dependency,
+# checked out as a sibling and built first.
+
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without leading v)'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout adapter
+        uses: actions/checkout@v4
+        with:
+          path: criteria-typescript-adapter-claude-agent
+
+      - name: Checkout SDK (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: brokenbots/criteria-typescript-adapter-sdk
+          path: criteria-typescript-adapter-sdk
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - uses: criteria/publish-adapter@v1
+
+      - name: Build SDK
+        working-directory: criteria-typescript-adapter-sdk
+        run: |
+          bun install
+          bun run build
+
+      - name: Build adapter binary
+        working-directory: criteria-typescript-adapter-claude-agent
+        run: |
+          bun install
+          bun run build
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish
+        uses: brokenbots/publish-adapter@v0
         with:
-          sdk: typescript
-          with_image: true
+          binary: ${{ github.workspace }}/criteria-typescript-adapter-claude-agent/bin/criteria-adapter-claude-agent
+          registry: ghcr.io/${{ github.repository_owner }}/criteria-adapter-claude-agent:${{ steps.ver.outputs.tag }}
