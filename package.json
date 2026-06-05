@@ -1,6 +1,6 @@
 {
   "name": "criteria-adapter-claude-agent",
-  "version": "2.0.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "build": "bun build --compile index.ts --outfile bin/criteria-adapter-claude-agent",

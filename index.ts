@@ -29,7 +29,7 @@ import type { Helpers, ExecuteRequest } from "@criteria/adapter-sdk";
 // ============================================================================
 
 const PLUGIN_NAME = "claude-agent";
-const PLUGIN_VERSION = "2.0.0";
+const PLUGIN_VERSION = "0.5.0";
 
 const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
 const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
