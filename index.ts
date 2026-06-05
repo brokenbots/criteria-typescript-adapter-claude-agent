@@ -355,7 +355,7 @@ export const adapterConfig = {
       model: { type: "string", required: false, description: "Model to use (e.g., claude-sonnet-4-6)" },
       cwd: { type: "string", required: false, description: "Working directory for the agent. Defaults to process.cwd()." },
       system_prompt: { type: "string", required: false, description: "Custom system prompt prepended to every execute call" },
-      thinking: { type: "bool", required: false, description: "Enable adaptive thinking mode" },
+      thinking: { type: "boolean", required: false, description: "Enable adaptive thinking mode" },
     },
   },
 
