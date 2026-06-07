@@ -6,31 +6,93 @@ on:
   pull_request:
     branches: [main, adapter-v2]
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.13
-      - run: bun install
-      - run: bun test
+permissions:
+  contents: read
 
-  build:
+jobs:
+  build-test:
+    name: Build & test
     runs-on: ubuntu-latest
-    needs: test
-    strategy:
-      matrix:
-        target: [linux-x64, linux-arm64, darwin-arm64]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout adapter
+        uses: actions/checkout@v4
+        with:
+          path: criteria-typescript-adapter-claude-agent
+      - name: Checkout SDK (sibling file dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: brokenbots/criteria-typescript-adapter-sdk
+          path: criteria-typescript-adapter-sdk
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.13
-      - run: bun install
-      - run: bun run build:${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - name: Build SDK
+        working-directory: criteria-typescript-adapter-sdk
+        run: bun install && bun run build
+      - name: Install, build, test
+        working-directory: criteria-typescript-adapter-claude-agent
+        run: |
+          bun install
+          bun run build
+          bun test
+
+  # WS49 — vulnerability gate (osv-scanner). BLOCKING: reads bun.lock; tree clean.
+  # Pinned google/osv-scanner-action by SHA (v2.3.8).
+  osv-scan:
+    name: Vulnerability scan (osv-scanner)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run osv-scanner
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
         with:
-          name: criteria-adapter-claude-agent-${{ matrix.target }}
-          path: bin/criteria-adapter-claude-agent
+          scan-args: |-
+            --config=osv-scanner.toml
+            --recursive
+            ./
+
+  # WS50 — non-blocking dependency-freshness report (bun outdated).
+  deps-report:
+    name: Dependency freshness (report-only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout adapter
+        uses: actions/checkout@v4
+        with:
+          path: criteria-typescript-adapter-claude-agent
+      - name: Checkout SDK (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: brokenbots/criteria-typescript-adapter-sdk
+          path: criteria-typescript-adapter-sdk
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - name: Build SDK
+        working-directory: criteria-typescript-adapter-sdk
+        run: bun install && bun run build
+      - name: Report outdated dependencies
+        working-directory: criteria-typescript-adapter-claude-agent
+        run: |
+          bun install
+          {
+            echo '### Outdated dependencies (bun outdated)'
+            echo '```'
+            bun outdated || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  all-checks:
+    name: All checks passed
+    runs-on: ubuntu-latest
+    needs: [build-test, osv-scan]
+    if: always()
+    steps:
+      - name: Verify required jobs succeeded
+        run: |
+          if [ "${{ needs.build-test.result }}" != "success" ]; then
+            echo "build-test did not succeed"; exit 1
+          fi
+          if [ "${{ needs.osv-scan.result }}" != "success" ]; then
+            echo "osv-scan did not succeed"; exit 1
+          fi

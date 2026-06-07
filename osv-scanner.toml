@@ -1,0 +1,22 @@
+# osv-scanner configuration (WS49 — vulnerability gate)
+#
+# Mandate: no shipping code with known security vulnerabilities. The CI `osv-scan`
+# job (.github/workflows/ci.yml) and `bun run vuln-scan` run osv-scanner over
+# this package's bun.lock using this config.
+#
+# Default posture: NO ignores. A clean tree carries an empty file.
+#
+# An ignore is an explicit, auditable decision — never a silent skip. Each entry
+# MUST carry:
+#   - id           the OSV / GHSA / advisory id (e.g. "GHSA-xxxx-xxxx-xxxx")
+#   - reason       why it is safe to defer (unreachable code path, false positive,
+#                  upstream fix unavailable, etc.)
+#   - ignoreUntil  a future review-expiry date (RFC3339). On expiry the finding
+#                  re-surfaces and must be re-justified or cleared.
+#
+# Example (keep commented unless an exception is actually in force):
+#
+# [[IgnoredVulns]]
+# id = "GHSA-xxxx-xxxx-xxxx"
+# reason = "Vulnerable function not reachable from our code paths."
+# ignoreUntil = "2026-09-01T00:00:00Z"

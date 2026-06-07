@@ -125,3 +125,22 @@ step "refactor" {
 ## Session persistence
 
 A Claude Code session ID is captured after the first execute call and reused for subsequent calls within the same Criteria session. This gives the agent memory across workflow steps without leaking context from unrelated prior sessions.
+
+## Security & dependencies
+
+Supply-chain controls and the dependency-freshness policy are documented in
+[SECURITY.md](SECURITY.md) and [docs/dependency-policy.md](docs/dependency-policy.md).
+Reproduce the CI security checks locally:
+
+```bash
+bun run vuln-scan      # osv-scanner — blocking known-vulnerability gate (reads bun.lock)
+bun run deps:outdated  # bun outdated — freshness report
+```
+
+## Publish (multi-platform)
+
+Tagging `vX.Y.Z` cross-compiles `linux/amd64`, `linux/arm64`, and `darwin/arm64`
+(`bun build --compile --target=…`) and publishes them as a single multi-platform,
+signed OCI artifact to `ghcr.io/brokenbots/criteria-adapter-claude-agent:X.Y.Z` via
+[`brokenbots/publish-adapter`](https://github.com/brokenbots/publish-adapter).
+Pin and lock it in your workflow with `criteria adapter lock`.

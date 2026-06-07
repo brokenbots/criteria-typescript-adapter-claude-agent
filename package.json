@@ -9,14 +9,22 @@
     "build:darwin-arm64": "bun build --compile --target=bun-darwin-arm64 index.ts --outfile bin/criteria-adapter-claude-agent",
     "binary:install": "cp bin/criteria-adapter-claude-agent ${HOME}/.criteria/plugins/",
     "test": "bun test",
-    "clean": "rm -f bin/criteria-adapter-claude-agent"
+    "clean": "rm -f bin/criteria-adapter-claude-agent",
+    "vuln-scan": "osv-scanner scan source --config=osv-scanner.toml -r .",
+    "deps:outdated": "bun outdated"
   },
   "dependencies": {
     "@criteria/adapter-sdk": "file:../criteria-typescript-adapter-sdk",
-    "@anthropic-ai/claude-agent-sdk": "^0.2.128",
-    "zod": "^4.0.0"
+    "@anthropic-ai/claude-agent-sdk": "^0.2.141",
+    "zod": "^4.4.3"
   },
   "trustedDependencies": [
     "protobufjs"
-  ]
+  ],
+  "overrides": {
+    "hono": "^4.12.21",
+    "ip-address": "^10.1.1",
+    "protobufjs": "^7.5.8",
+    "qs": "^6.15.2"
+  }
 }
