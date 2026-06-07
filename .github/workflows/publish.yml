@@ -1,8 +1,10 @@
 name: Publish Adapter
 
-# Build the adapter (toolchain-specific), then publish the binary via the
-# reusable brokenbots/publish-adapter action. The SDK is a file: dependency,
-# checked out as a sibling and built first.
+# Cross-compile the adapter for every supported platform with bun's --compile
+# --target, lay the binaries out as bin/<os>/<arch>/<name>, and publish them as
+# a single multi-platform, signed OCI artifact via the reusable
+# brokenbots/publish-adapter action. The SDK is a file: dependency, checked out
+# as a sibling and built first.
 
 on:
   push:
@@ -18,7 +20,10 @@ on:
 permissions:
   contents: read
   packages: write
-  id-token: write
+  id-token: write # cosign keyless signing
+
+env:
+  ADAPTER_NAME: criteria-adapter-claude-agent
 
 jobs:
   publish:
@@ -45,11 +50,25 @@ jobs:
           bun install
           bun run build
 
-      - name: Build adapter binary
+      - name: Cross-compile adapter binaries
         working-directory: criteria-typescript-adapter-claude-agent
+        # bun-<os>-<arch> targets -> bin/<os>/<arch>/<name>, the layout
+        # `criteria adapter publish` scans to build one multi-platform artifact.
         run: |
+          set -euo pipefail
           bun install
-          bun run build
+          declare -A targets=(
+            ["linux/amd64"]="bun-linux-x64"
+            ["linux/arm64"]="bun-linux-arm64"
+            ["darwin/arm64"]="bun-darwin-arm64"
+          )
+          for platform in "${!targets[@]}"; do
+            outdir="artifact/bin/${platform}"
+            mkdir -p "$outdir"
+            echo "building ${platform} (${targets[$platform]})"
+            bun build --compile --target="${targets[$platform]}" \
+              index.ts --outfile "$outdir/${ADAPTER_NAME}"
+          done
 
       - name: Resolve version
         id: ver
@@ -66,5 +85,6 @@ jobs:
       - name: Publish
         uses: brokenbots/publish-adapter@v0
         with:
-          binary: ${{ github.workspace }}/criteria-typescript-adapter-claude-agent/bin/criteria-adapter-claude-agent
-          registry: ghcr.io/${{ github.repository_owner }}/criteria-adapter-claude-agent:${{ steps.ver.outputs.tag }}
+          # Directory containing the multi-platform bin/<os>/<arch>/ tree.
+          binary: ${{ github.workspace }}/criteria-typescript-adapter-claude-agent/artifact
+          registry: ghcr.io/${{ github.repository_owner }}/${{ env.ADAPTER_NAME }}:${{ steps.ver.outputs.tag }}

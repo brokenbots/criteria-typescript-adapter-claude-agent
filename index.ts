@@ -332,7 +332,7 @@ export const adapterConfig = {
   version: PLUGIN_VERSION,
   description: "Claude Code agent adapter for Criteria workflows.",
 
-  source_url: "https://github.com/criteria-adapters/claude-agent",
+  source_url: "https://github.com/brokenbots/criteria-typescript-adapter-claude-agent",
   capabilities: ["multi_turn", "tool_calling", "structured_events"],
   platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
 
