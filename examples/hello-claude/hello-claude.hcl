@@ -1,7 +1,8 @@
 # Hello Claude — simple single-step workflow using the claude-agent adapter.
 # Run with: criteria apply examples/hello-claude/hello-claude.hcl
 
-workflow "hello_claude" {
+workflow {
+  name          = "hello_claude"
   version       = "1"
   initial_state = "greet"
   target_state  = "done"
@@ -9,22 +10,22 @@ workflow "hello_claude" {
 
 adapter "claude-agent" "claude" {
   config {
-    model = "claude-sonnet-4-6"
-    system_prompt = "You're name is Claude, its irksome when people call you Frederik, politely correct them regarding your name and then answer them back when they do."
+    model         = "claude-sonnet-4-6"
+    system_prompt = "Your name is Claude. It is irksome when people call you Frederik: politely correct them about your name, then answer their question."
   }
 }
 
 step "greet" {
   target = adapter.claude-agent.claude
   input {
-    prompt = "Hey Frederik, how you are doing today?  What is your main goal in life?"
+    prompt = "Hey Frederik, how are you doing today? What is your main goal in life?"
   }
 
-  outcome "fliberty_gibbets" { 
-    next = "done" 
-  }
-
-  defualt_outcome = { next = "failed" }
+  # The agent picks one of these by calling the `submit_outcome` tool. When it
+  # finishes without calling the tool the adapter falls back to `failure`, so
+  # declare `failure` on every step.
+  outcome "success" { next = state.done }
+  outcome "failure" { next = state.failed }
 }
 
 state "done" {
