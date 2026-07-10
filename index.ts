@@ -31,7 +31,10 @@ import type { Helpers, ExecuteRequest } from "@criteria/adapter-sdk";
 // ============================================================================
 
 const PLUGIN_NAME = "claude-agent";
-const PLUGIN_VERSION = "0.5.1";
+// Injected at build time via `--define` (see scripts/build.ts) from the release
+// tag, so the reported version can't drift from what was published. Falls back
+// to "0.0.0-dev" when run without a compile step (e.g. `bun test`).
+const PLUGIN_VERSION = process.env.PLUGIN_VERSION ?? "0.0.0-dev";
 
 /**
  * Passed through to the Claude Code subprocess. The agent SDK treats
