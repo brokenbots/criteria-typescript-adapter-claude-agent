@@ -22,9 +22,10 @@
     "protobufjs"
   ],
   "overrides": {
-    "hono": "^4.12.21",
+    "@grpc/grpc-js": "^1.14.4",
+    "hono": "^4.12.25",
     "ip-address": "^10.1.1",
-    "protobufjs": "^7.5.8",
+    "protobufjs": "^7.6.3",
     "qs": "^6.15.2"
   }
 }
