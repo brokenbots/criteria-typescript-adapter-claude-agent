@@ -1,13 +1,13 @@
 {
   "name": "criteria-adapter-claude-agent",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "scripts": {
-    "build": "bun build --compile index.ts --outfile bin/criteria-adapter-claude-agent",
-    "build:linux-x64": "bun build --compile --target=bun-linux-x64 index.ts --outfile bin/criteria-adapter-claude-agent",
-    "build:linux-arm64": "bun build --compile --target=bun-linux-arm64 index.ts --outfile bin/criteria-adapter-claude-agent",
-    "build:darwin-arm64": "bun build --compile --target=bun-darwin-arm64 index.ts --outfile bin/criteria-adapter-claude-agent",
-    "binary:install": "cp bin/criteria-adapter-claude-agent ${HOME}/.criteria/plugins/",
+    "build": "bun scripts/build.ts",
+    "build:linux-x64": "bun scripts/build.ts --target=bun-linux-x64",
+    "build:linux-arm64": "bun scripts/build.ts --target=bun-linux-arm64",
+    "build:darwin-arm64": "bun scripts/build.ts --target=bun-darwin-arm64",
+    "binary:install": "mkdir -p ${HOME}/.criteria/adapters && cp bin/criteria-adapter-claude-agent ${HOME}/.criteria/adapters/",
     "test": "bun test",
     "clean": "rm -f bin/criteria-adapter-claude-agent",
     "vuln-scan": "osv-scanner scan source --config=osv-scanner.toml -r .",
@@ -22,9 +22,10 @@
     "protobufjs"
   ],
   "overrides": {
-    "hono": "^4.12.21",
+    "@grpc/grpc-js": "^1.14.4",
+    "hono": "^4.12.25",
     "ip-address": "^10.1.1",
-    "protobufjs": "^7.5.8",
+    "protobufjs": "^7.6.3",
     "qs": "^6.15.2"
   }
 }

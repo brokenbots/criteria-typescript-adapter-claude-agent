@@ -15,6 +15,12 @@ Unlike a plain API wrapper, this adapter:
 - [Bun](https://bun.sh/) >= 1.2.0
 - Claude Code CLI installed and authenticated (`claude` command available)
 
+The compiled adapter binary does not embed the Claude Code CLI: `bun build
+--compile` cannot bundle the per-platform native binary that
+`@anthropic-ai/claude-agent-sdk` resolves at runtime. The adapter therefore
+locates `claude` on `PATH` (override with the `claude_executable` config field),
+and any image shipping this adapter must install the CLI alongside it.
+
 ### Build
 
 ```bash
@@ -27,7 +33,7 @@ bun run build
 ```bash
 bun run binary:install
 # or manually:
-cp bin/criteria-adapter-claude-agent ~/.criteria/plugins/
+cp bin/criteria-adapter-claude-agent ~/.criteria/adapters/
 ```
 
 ## Configuration
@@ -50,8 +56,9 @@ Declared on the `adapter` block. Shared across all steps that use this adapter i
 |---|---|---|---|
 | `model` | string | no | Model to use, e.g. `claude-sonnet-4-6`. Falls back to the Claude Code CLI default. |
 | `cwd` | string | no | Working directory for the agent. Defaults to the process working directory. |
-| `system_prompt` | string | no | Additional system prompt appended to every execute call. Outcome instructions are always prepended automatically. |
-| `thinking` | bool | no | Enable adaptive thinking mode (`true`/`false`). |
+| `system_prompt` | string | no | Additional system prompt for every execute call. The outcome instructions are always appended after it. |
+| `thinking` | boolean | no | Enable adaptive thinking mode (`true`/`false`). |
+| `claude_executable` | string | no | Path to the Claude Code CLI. Defaults to `claude` on `PATH`. |
 
 ### Step Input Fields
 
@@ -74,10 +81,18 @@ When the agent finishes a step it calls the built-in `submit_outcome` MCP tool, 
 
 ### Fallback outcomes
 
-If the agent finishes without calling `submit_outcome`:
+Calling `submit_outcome` is model behaviour, not a guarantee — the agent will
+sometimes answer a prompt and stop. When that happens the adapter re-prompts it
+to make the tool call, up to 3 times, emitting an `outcome.reprompt` event each
+time.
+
+If the agent still has not called `submit_outcome`:
 
 - If `needs_review` is in the step's declared outcomes, `needs_review` is emitted.
 - Otherwise, `failure` is emitted.
+
+Declare `failure` (or `needs_review`) on every step so this fallback has a
+transition to take.
 
 ## Adapter Events
 
@@ -89,11 +104,19 @@ The adapter emits structured events you can observe via Criteria's event stream.
 | `tool.progress` | `{ tool: string, message: string }` | Progress update from a tool invocation. |
 | `query.complete` | `{ durationMs, turns, costUsd }` | Query completed successfully. |
 | `query.error` | `{ subtype: string, errors: string[] }` | Query ended with an error. |
-| `outcome.failure` | `{ reason: string }` | Emitted when the agent finishes without submitting an outcome. |
+| `outcome.reprompt` | `{ attempt, maxAttempts }` | The agent stopped without calling `submit_outcome`; it is being asked again. |
+| `outcome.failure` | `{ reason: string, attempts: number }` | Emitted when the agent finishes without submitting an outcome. |
 
 ## Workflow Example
 
 ```hcl
+workflow {
+  name          = "refactor_auth"
+  version       = "1"
+  initial_state = "refactor"
+  target_state  = "done"
+}
+
 adapter "claude-agent" "claude" {
   config {
     model         = "claude-sonnet-4-6"
@@ -108,11 +131,14 @@ step "refactor" {
     prompt = "Refactor the auth module to use OAuth2."
   }
 
-  outcome "success"      { next = "test" }
-  outcome "needs_review" { next = "review" }
-  outcome "failure"      { next = "failed" }
+  outcome "success"      { next = step.test }
+  outcome "needs_review" { next = step.review }
+  outcome "failure"      { next = state.failed }
 }
 ```
+
+A runnable single-step workflow lives in
+[`examples/hello-claude/hello-claude.hcl`](examples/hello-claude/hello-claude.hcl).
 
 ## How it works
 
@@ -120,7 +146,8 @@ step "refactor" {
 2. A custom MCP server is injected with a `submit_outcome` tool. The allowed outcome names are passed to the agent in its system context.
 3. The agent works autonomously using its built-in tools to read, edit, and run commands.
 4. Permission requests from the agent are forwarded to Criteria via `helpers.permission.request()` and resolved when the operator responds.
-5. When the agent calls `submit_outcome`, the query is interrupted and the workflow transitions to the next state.
+5. When the agent calls `submit_outcome`, the outcome is recorded. Once the query finishes the workflow transitions to the next state.
+6. If the query ends without a `submit_outcome` call, the adapter resumes the session and asks the agent again (up to 3 times) before taking the fallback outcome.
 
 ## Session persistence
 

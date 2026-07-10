@@ -22,6 +22,8 @@ import { serve } from "@criteria/adapter-sdk";
 import { query, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { Query, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { Helpers, ExecuteRequest } from "@criteria/adapter-sdk";
 
 // ============================================================================
@@ -29,9 +31,38 @@ import type { Helpers, ExecuteRequest } from "@criteria/adapter-sdk";
 // ============================================================================
 
 const PLUGIN_NAME = "claude-agent";
-const PLUGIN_VERSION = "0.5.0";
+// Injected at build time via `--define` (see scripts/build.ts) from the release
+// tag, so the reported version can't drift from what was published. Falls back
+// to "0.0.0-dev" when run without a compile step (e.g. `bun test`).
+const PLUGIN_VERSION = process.env.PLUGIN_VERSION ?? "0.0.0-dev";
+
+/**
+ * Passed through to the Claude Code subprocess. The agent SDK treats
+ * `options.env` as a full replacement for the child environment, so anything
+ * omitted here is simply absent — without PATH and HOME the CLI cannot resolve
+ * its own tools or read its credentials. The host environment is not forwarded
+ * wholesale: the agent runs untrusted model output, so only these are shared.
+ */
+const ENV_PASSTHROUGH = [
+  "PATH",
+  "HOME",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "TMPDIR",
+] as const;
 
 const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
+
+/**
+ * Calling `submit_outcome` is model behaviour, not a guarantee — the agent
+ * regularly answers a conversational prompt and stops. Re-prompt it this many
+ * times before giving up and taking the fallback outcome.
+ */
+const MAX_FINALIZE_ATTEMPTS = 3;
 const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
 
 // ============================================================================
@@ -54,6 +85,9 @@ function buildOutcomeMcpServer(allowedOutcomes: string[], capture: OutcomeCaptur
 
   return createSdkMcpServer({
     name: "criteria-workflow",
+    // Without this the tool is deferred behind tool search, so the agent never
+    // sees `submit_outcome` in its prompt and the step cannot be finalized.
+    alwaysLoad: true,
     tools: [
       {
         name: SUBMIT_OUTCOME_TOOL_NAME,
@@ -113,6 +147,51 @@ function buildOutcomeMcpServer(allowedOutcomes: string[], capture: OutcomeCaptur
       },
     ],
   });
+}
+
+// ============================================================================
+// Claude Code CLI discovery
+// ============================================================================
+
+function passthroughEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of ENV_PASSTHROUGH) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  return env;
+}
+
+function isExecutable(candidate: string): boolean {
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return fs.statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Locate the Claude Code CLI.
+ *
+ * The agent SDK's default resolution loads a per-platform optional npm package
+ * at runtime. `bun build --compile` cannot bundle that native binary, so a
+ * compiled adapter must point the SDK at an executable explicitly.
+ */
+function resolveClaudeExecutable(configured?: string): string | undefined {
+  if (configured) {
+    if (!isExecutable(configured)) {
+      throw new Error(`claude_executable "${configured}" is not an executable file`);
+    }
+    return configured;
+  }
+
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, "claude");
+    if (isExecutable(candidate)) return candidate;
+  }
+  return undefined;
 }
 
 // ============================================================================
@@ -257,7 +336,12 @@ async function executeStep(
       ? `You are integrated into a workflow system. When you have completed your task, you MUST call the \`${SUBMIT_OUTCOME_TOOL_NAME}\` tool to finalize the step. The allowed outcomes are: ${allowedOutcomes.join(", ")}. Do not stop or explain that you are done — just call the tool.`
       : `You are integrated into a workflow system.`;
 
-  const systemPromptAppend = helpers.session.get<string>("systemPromptAppend") ?? outcomeInstructions;
+  // The outcome instructions are always appended: without them the agent never
+  // learns that `submit_outcome` exists and the step can only fail.
+  const customSystemPrompt = helpers.session.get<string>("systemPromptAppend");
+  const systemPromptAppend = customSystemPrompt
+    ? `${customSystemPrompt}\n\n${outcomeInstructions}`
+    : outcomeInstructions;
 
   await helpers.log.stdout("[claude-agent] Starting agent query...\n");
 
@@ -266,46 +350,81 @@ async function executeStep(
   const abortController = new AbortController();
 
   const cwd = helpers.session.get<string>("cwd") ?? process.cwd();
-  const model = helpers.session.get<string>("model") ?? undefined;
+  // Per-step `input.model` overrides the adapter-level `config.model`.
+  const model = req.input.model || helpers.session.get<string>("model") || undefined;
   const thinking = helpers.session.get<boolean>("thinking") ?? false;
+
+  const claudeExecutable = resolveClaudeExecutable(
+    helpers.session.get<string>("claudeExecutable") ?? undefined
+  );
+  if (!claudeExecutable) {
+    throw new Error(
+      "Claude Code CLI not found on PATH. Install it, or set the adapter's `claude_executable` config field."
+    );
+  }
 
   const apiKey = (await helpers.secrets.get("ANTHROPIC_API_KEY")) ?? undefined;
   const baseURL = (await helpers.secrets.get("ANTHROPIC_BASE_URL")) ?? undefined;
   const authToken = (await helpers.secrets.get("ANTHROPIC_AUTH_TOKEN")) ?? undefined;
 
-  const q = query({
-    prompt,
-    options: {
-      abortController,
-      systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend },
-      cwd,
-      canUseTool: buildCanUseTool(helpers),
-      allowedTools: [`mcp__${mcpServer.name}__${SUBMIT_OUTCOME_TOOL_NAME}`],
-      tools: { type: "preset", preset: "claude_code" },
-      mcpServers: { [mcpServer.name]: mcpServer },
-      persistSession: claudeSessionId !== null,
-      resume: claudeSessionId || undefined,
-      model,
-      thinking: thinking ? { type: "adaptive" } : undefined,
-      env: {
-        CLAUDE_AGENT_SDK_CLIENT_APP: "criteria-adapter-claude-agent/2.0.0",
-        ...(apiKey ? { ANTHROPIC_API_KEY: apiKey } : {}),
-        ...(baseURL ? { ANTHROPIC_BASE_URL: baseURL } : {}),
-        ...(authToken ? { ANTHROPIC_AUTH_TOKEN: authToken } : {}),
-      },
+  const buildOptions = (resume: string | undefined) => ({
+    abortController,
+    systemPrompt: { type: "preset" as const, preset: "claude_code" as const, append: systemPromptAppend },
+    cwd,
+    canUseTool: buildCanUseTool(helpers),
+    allowedTools: [`mcp__${mcpServer.name}__${SUBMIT_OUTCOME_TOOL_NAME}`],
+    tools: { type: "preset" as const, preset: "claude_code" as const },
+    mcpServers: { [mcpServer.name]: mcpServer },
+    // Must stay on for the first execute too, otherwise nothing is written to
+    // disk and the `resume` on the next step has no session to attach to.
+    persistSession: true,
+    resume,
+    model,
+    thinking: thinking ? { type: "adaptive" as const } : undefined,
+    pathToClaudeCodeExecutable: claudeExecutable,
+    env: {
+      ...passthroughEnv(),
+      CLAUDE_AGENT_SDK_CLIENT_APP: `criteria-adapter-claude-agent/${PLUGIN_VERSION}`,
+      ...(apiKey ? { ANTHROPIC_API_KEY: apiKey } : {}),
+      ...(baseURL ? { ANTHROPIC_BASE_URL: baseURL } : {}),
+      ...(authToken ? { ANTHROPIC_AUTH_TOKEN: authToken } : {}),
     },
   });
 
   const state = { finalizedOutcome, finalizedReason, lastResultText, claudeSessionId };
 
-  try {
-    await handleMessageStream(helpers, q, state);
-  } catch (e) {
-    await helpers.log.stderr(`[claude-agent] Query error: ${e}\n`);
-  } finally {
-    // Persist session ID for resume
-    helpers.session.set("claudeSessionId", state.claudeSessionId);
-    helpers.session.set("lastResultText", state.lastResultText);
+  const runQuery = async (prompt: string, resume: string | undefined) => {
+    try {
+      await handleMessageStream(helpers, query({ prompt, options: buildOptions(resume) }), state);
+    } catch (e) {
+      await helpers.log.stderr(`[claude-agent] Query error: ${e}\n`);
+    } finally {
+      // Persist session ID for resume
+      helpers.session.set("claudeSessionId", state.claudeSessionId);
+      helpers.session.set("lastResultText", state.lastResultText);
+    }
+  };
+
+  await runQuery(prompt, claudeSessionId || undefined);
+
+  // The agent often answers and stops without finalizing. Re-prompt it in the
+  // same session, resuming so it keeps the conversation context.
+  let attempts = 0;
+  while (
+    !capture.finalized &&
+    allowedOutcomes.length > 0 &&
+    state.claudeSessionId &&
+    attempts < MAX_FINALIZE_ATTEMPTS
+  ) {
+    attempts++;
+    await helpers.log.adapterEvent("outcome.reprompt", {
+      attempt: attempts,
+      maxAttempts: MAX_FINALIZE_ATTEMPTS,
+    });
+    await runQuery(
+      `You have not finalized this workflow step. Call the \`${SUBMIT_OUTCOME_TOOL_NAME}\` tool now with one of: ${allowedOutcomes.join(", ")}. Respond with the tool call only.`,
+      state.claudeSessionId
+    );
   }
 
   // Determine outcome from capture
@@ -314,12 +433,13 @@ async function executeStep(
     return;
   }
 
-  // No outcome was submitted
+  // No outcome was submitted, even after re-prompting
+  const reason = `Agent completed without submitting an outcome after ${attempts} re-prompt(s)`;
   if (allowedOutcomes.includes("needs_review")) {
-    await helpers.outcomes.finalize("needs_review", { reason: "Agent completed without submitting an outcome" });
+    await helpers.outcomes.finalize("needs_review", { reason });
   } else {
-    await helpers.log.adapterEvent("outcome.failure", { reason: "missing submit_outcome" });
-    await helpers.outcomes.finalize("failure", { reason: "Agent completed without submitting an outcome" });
+    await helpers.log.adapterEvent("outcome.failure", { reason: "missing submit_outcome", attempts });
+    await helpers.outcomes.finalize("failure", { reason });
   }
 }
 
@@ -356,6 +476,7 @@ export const adapterConfig = {
       cwd: { type: "string", required: false, description: "Working directory for the agent. Defaults to process.cwd()." },
       system_prompt: { type: "string", required: false, description: "Custom system prompt prepended to every execute call" },
       thinking: { type: "boolean", required: false, description: "Enable adaptive thinking mode" },
+      claude_executable: { type: "string", required: false, description: "Path to the Claude Code CLI. Defaults to `claude` on PATH." },
     },
   },
 
@@ -371,6 +492,7 @@ export const adapterConfig = {
     helpers.session.set("model", req.config.model || undefined);
     helpers.session.set("cwd", req.config.cwd || undefined);
     helpers.session.set("thinking", req.config.thinking === true || req.config.thinking === "true" || undefined);
+    helpers.session.set("claudeExecutable", req.config.claude_executable || undefined);
     helpers.session.set(
       "systemPromptAppend",
       req.config.system_prompt

@@ -45,6 +45,11 @@ class MockMcpServer {
 
 const adapterPath = new URL("../index.ts", import.meta.url).href;
 
+// The adapter resolves the Claude Code CLI up front and refuses to run without
+// it. These tests mock the agent SDK so nothing is actually spawned, but the
+// resolution still runs — point it at an executable that always exists.
+const FAKE_CLI = process.execPath;
+
 describe("claude-agent adapter v2", () => {
   test("open session, execute, and finalize success", async () => {
     const mod = await import(`${adapterPath}?${Date.now()}`);
@@ -54,7 +59,7 @@ describe("claude-agent adapter v2", () => {
     });
     await host.start();
 
-    await host.openSession({ config: { model: "test-model" } });
+    await host.openSession({ config: { model: "test-model", claude_executable: FAKE_CLI } });
     const result = await host.execute({
       stepName: "test-step",
       input: { prompt: "Hello" },
@@ -72,7 +77,7 @@ describe("claude-agent adapter v2", () => {
     });
     await host.start();
 
-    await host.openSession({ config: { cwd: "/tmp" } });
+    await host.openSession({ config: { cwd: "/tmp", claude_executable: FAKE_CLI } });
     await host.execute({
       stepName: "step1",
       input: { prompt: "Do something" },
@@ -85,7 +90,7 @@ describe("claude-agent adapter v2", () => {
 
     await host.closeSession();
 
-    await host.openSession({ config: { cwd: "/tmp" } });
+    await host.openSession({ config: { cwd: "/tmp", claude_executable: FAKE_CLI } });
     await host.restore(snap);
 
     const snap2 = await host.snapshot();
@@ -132,7 +137,7 @@ describe("claude-agent adapter v2", () => {
     });
     await host.start();
 
-    await host.openSession({ config: {} });
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
     const result = await host.execute({
       stepName: "stress",
       input: { prompt: "stress test" },
