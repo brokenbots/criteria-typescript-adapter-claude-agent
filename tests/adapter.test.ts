@@ -98,6 +98,72 @@ describe("claude-agent adapter v2", () => {
     await host.stop();
   });
 
+  test("per-step cwd input overrides config-level cwd", async () => {
+    let capturedCwd: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedCwd = opts.options?.cwd;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { cwd: "/session-level-cwd", claude_executable: FAKE_CLI } });
+    await host.execute({
+      stepName: "cwd-override-step",
+      input: { prompt: "test", cwd: "/step-level-cwd" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedCwd).toBe("/step-level-cwd");
+    await host.stop();
+  });
+
+  test("config-level cwd is used when input does not override", async () => {
+    let capturedCwd: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedCwd = opts.options?.cwd;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { cwd: "/config-cwd", claude_executable: FAKE_CLI } });
+    await host.execute({
+      stepName: "config-cwd-step",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedCwd).toBe("/config-cwd");
+    await host.stop();
+  });
+
   test("concurrent permission stress test — 50 parallel requests", async () => {
     let permissionCount = 0;
 

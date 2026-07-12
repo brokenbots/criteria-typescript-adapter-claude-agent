@@ -349,7 +349,8 @@ async function executeStep(
   const mcpServer = buildOutcomeMcpServer(allowedOutcomes, capture);
   const abortController = new AbortController();
 
-  const cwd = helpers.session.get<string>("cwd") ?? process.cwd();
+  // Per-step `input.cwd` overrides the adapter-level `config.cwd`.
+  const cwd = req.input.cwd || helpers.session.get<string>("cwd") || process.cwd();
   // Per-step `input.model` overrides the adapter-level `config.model`.
   const model = req.input.model || helpers.session.get<string>("model") || undefined;
   const thinking = helpers.session.get<boolean>("thinking") ?? false;
@@ -484,6 +485,7 @@ export const adapterConfig = {
     fields: {
       prompt: { type: "string", required: true, description: "The task prompt to send to Claude Code" },
       model: { type: "string", required: false, description: "Per-step model override" },
+      cwd: { type: "string", required: false, description: "Per-step working directory override. Takes precedence over config.cwd." },
     },
   },
 
