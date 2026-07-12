@@ -13,9 +13,13 @@
  * - Structured events for observability
  *
  * Secrets:
- * - ANTHROPIC_API_KEY    – Required for first-party API access.
- * - ANTHROPIC_BASE_URL   – Optional. Override the API base URL.
+ * - ANTHROPIC_API_KEY    – Optional. If unset, the Claude Code CLI falls back
+ *   to its own stored credentials (e.g. `claude` login / OAuth).
  * - ANTHROPIC_AUTH_TOKEN – Optional. Auth token.
+ *
+ * Config:
+ * - base_url             – Optional. Overrides the Anthropic API base URL.
+ *   Falls back to the ANTHROPIC_BASE_URL environment variable.
  */
 
 import { serve } from "@criteria/adapter-sdk";
@@ -365,7 +369,11 @@ async function executeStep(
   }
 
   const apiKey = (await helpers.secrets.get("ANTHROPIC_API_KEY")) ?? undefined;
-  const baseURL = (await helpers.secrets.get("ANTHROPIC_BASE_URL")) ?? undefined;
+  // base_url is a config field (not a secret): precedence is config, then the
+  // ANTHROPIC_BASE_URL environment variable. It is not in ENV_PASSTHROUGH, so
+  // the env var only reaches the subprocess if we forward it explicitly below.
+  const baseURL =
+    helpers.session.get<string>("baseUrl") || process.env.ANTHROPIC_BASE_URL || undefined;
   const authToken = (await helpers.secrets.get("ANTHROPIC_AUTH_TOKEN")) ?? undefined;
 
   const buildOptions = (resume: string | undefined) => ({
@@ -458,8 +466,7 @@ export const adapterConfig = {
   platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
 
   secrets: [
-    { name: "ANTHROPIC_API_KEY", required: true, description: "Anthropic API key" },
-    { name: "ANTHROPIC_BASE_URL", required: false, description: "Override base URL" },
+    { name: "ANTHROPIC_API_KEY", required: false, description: "Anthropic API key. If unset, the Claude Code CLI uses its own stored credentials." },
     { name: "ANTHROPIC_AUTH_TOKEN", required: false, description: "Auth token" },
   ],
 
@@ -478,6 +485,7 @@ export const adapterConfig = {
       system_prompt: { type: "string", required: false, description: "Custom system prompt prepended to every execute call" },
       thinking: { type: "boolean", required: false, description: "Enable adaptive thinking mode" },
       claude_executable: { type: "string", required: false, description: "Path to the Claude Code CLI. Defaults to `claude` on PATH." },
+      base_url: { type: "string", required: false, description: "Override the Anthropic API base URL. Falls back to the ANTHROPIC_BASE_URL environment variable." },
     },
   },
 
@@ -495,6 +503,7 @@ export const adapterConfig = {
     helpers.session.set("cwd", req.config.cwd || undefined);
     helpers.session.set("thinking", req.config.thinking === true || req.config.thinking === "true" || undefined);
     helpers.session.set("claudeExecutable", req.config.claude_executable || undefined);
+    helpers.session.set("baseUrl", req.config.base_url || undefined);
     helpers.session.set(
       "systemPromptAppend",
       req.config.system_prompt
@@ -517,6 +526,8 @@ export const adapterConfig = {
       cwd: helpers.session.get<string>("cwd") ?? undefined,
       thinking: helpers.session.get<boolean>("thinking") ?? undefined,
       systemPromptAppend: helpers.session.get<string>("systemPromptAppend") ?? undefined,
+      baseUrl: helpers.session.get<string>("baseUrl") ?? undefined,
+      claudeExecutable: helpers.session.get<string>("claudeExecutable") ?? undefined,
     };
     const state = new TextEncoder().encode(JSON.stringify(payload));
     return { state, schemaVersion: 1 };
@@ -531,6 +542,8 @@ export const adapterConfig = {
     helpers.session.set("cwd", snapshot.cwd as string | undefined);
     helpers.session.set("thinking", snapshot.thinking as boolean | undefined);
     helpers.session.set("systemPromptAppend", snapshot.systemPromptAppend as string | undefined);
+    helpers.session.set("baseUrl", snapshot.baseUrl as string | undefined);
+    helpers.session.set("claudeExecutable", snapshot.claudeExecutable as string | undefined);
   },
 };
 
