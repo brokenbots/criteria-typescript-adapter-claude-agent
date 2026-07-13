@@ -18,7 +18,7 @@ syntax = "proto3";
 
 package criteria.v2;
 
-option go_package = "github.com/brokenbots/criteria/proto/criteria/v2;criteriav2";
+option go_package = "github.com/brokenbots/criteria-adapter-proto/criteria/v2;criteriav2";
 
 import "criteria/v2/options.proto";
 import "google/protobuf/struct.proto";
@@ -191,13 +191,18 @@ message ToolInvocation {
 
 message ExecuteResult {
   string              outcome      = 1;
-  // outputs is set when chunk == nil (non-chunked or single-message payload).
-  map<string, string> outputs      = 2;
   Chunk               chunk        = 3;
-  // outputs_json carries the JSON-encoded bytes of an outputs map fragment when
-  // chunk is non-nil.  Collect all fragments in Chunk.seq order, concatenate,
-  // then unmarshal to map<string,string>.
+  // outputs_json is the sole output channel: the JSON-encoded bytes of the
+  // outputs object. Values are encoded with their native JSON type
+  // (string/number/bool/object/array), so the host decodes them to native cty
+  // types — no jsondecode() needed in workflows. When chunk is non-nil, collect
+  // all fragments in Chunk.seq order and concatenate before decoding; when chunk
+  // is nil, outputs_json is the whole object in one message.
   bytes               outputs_json = 4;
+  // Field 2 was the legacy map<string,string> outputs channel, removed in the
+  // v2 typed-outputs cutover. Do not reuse.
+  reserved 2;
+  reserved "outputs";
   reserved 100 to 999;
 }
 

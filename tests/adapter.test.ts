@@ -98,6 +98,217 @@ describe("claude-agent adapter v2", () => {
     await host.stop();
   });
 
+  test("snapshot and restore preserve claude_executable", async () => {
+    // openSession normally seeds claudeExecutable from config, but restore
+    // does not re-run openSession — the path must survive in the blob or the
+    // adapter silently falls back to a PATH lookup.
+    let resolvedExecutable: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          resolvedExecutable = opts.options?.pathToClaudeCodeExecutable;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    await host.execute({
+      stepName: "seed",
+      input: { prompt: "seed" },
+      allowedOutcomes: ["success"],
+    });
+
+    const snap = await host.snapshot();
+    await host.closeSession();
+
+    // Restore into a session that did NOT receive claude_executable via config,
+    // so the only source of the path is the snapshot blob.
+    await host.openSession({ config: {} });
+    await host.restore(snap);
+    await host.execute({
+      stepName: "restored",
+      input: { prompt: "restored" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(resolvedExecutable).toBe(FAKE_CLI);
+    await host.stop();
+  });
+
+  test("per-step cwd input overrides config-level cwd", async () => {
+    let capturedCwd: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedCwd = opts.options?.cwd;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { cwd: "/session-level-cwd", claude_executable: FAKE_CLI } });
+    await host.execute({
+      stepName: "cwd-override-step",
+      input: { prompt: "test", cwd: "/step-level-cwd" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedCwd).toBe("/step-level-cwd");
+    await host.stop();
+  });
+
+  test("config-level cwd is used when input does not override", async () => {
+    let capturedCwd: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedCwd = opts.options?.cwd;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { cwd: "/config-cwd", claude_executable: FAKE_CLI } });
+    await host.execute({
+      stepName: "config-cwd-step",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedCwd).toBe("/config-cwd");
+    await host.stop();
+  });
+
+  test("base_url config is forwarded to the subprocess env", async () => {
+    let capturedEnv: Record<string, string> | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedEnv = opts.options?.env;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({
+      config: { base_url: "https://config.example/v1", claude_executable: FAKE_CLI },
+    });
+    await host.execute({
+      stepName: "base-url-config",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedEnv?.ANTHROPIC_BASE_URL).toBe("https://config.example/v1");
+    await host.stop();
+  });
+
+  test("base_url falls back to the ANTHROPIC_BASE_URL environment variable", async () => {
+    let capturedEnv: Record<string, string> | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedEnv = opts.options?.env;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const previous = process.env.ANTHROPIC_BASE_URL;
+    process.env.ANTHROPIC_BASE_URL = "https://env.example/v1";
+    try {
+      const mod = await import(`${adapterPath}?${Date.now()}`);
+      const host = new TestHost({
+        config: mod.adapterConfig,
+        autoGrantPermissions: true,
+      });
+      await host.start();
+
+      await host.openSession({ config: { claude_executable: FAKE_CLI } });
+      await host.execute({
+        stepName: "base-url-env",
+        input: { prompt: "test" },
+        allowedOutcomes: ["success"],
+      });
+
+      expect(capturedEnv?.ANTHROPIC_BASE_URL).toBe("https://env.example/v1");
+      await host.stop();
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = previous;
+    }
+  });
+
+  test("ANTHROPIC_API_KEY is not required to open a session", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    // No secrets provisioned — the adapter must still open and run, leaving
+    // auth to the Claude Code CLI's own credential store.
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "no-api-key",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(["success", "failure", "needs_review"]).toContain(result.outcome);
+    await host.stop();
+  });
+
   test("concurrent permission stress test — 50 parallel requests", async () => {
     let permissionCount = 0;
 

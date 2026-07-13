@@ -13,6 +13,8 @@
  * Usage: bun scripts/build.ts [--target=<bun-target>] [--outfile=<path>]
  */
 import pkg from "../package.json" with { type: "json" };
+import * as fs from "fs";
+import * as path from "path";
 
 const args = process.argv.slice(2);
 const arg = (name: string): string | undefined =>
@@ -38,4 +40,15 @@ console.error(`building ${outfile} as version ${version}${target ? ` (${target})
 
 const proc = Bun.spawn(cmd, { stdout: "inherit", stderr: "inherit" });
 const code = await proc.exited;
+
+if (code === 0) {
+  // Copy proto files alongside the binary so the gRPC server can load them
+  // at runtime via the binaryDir fallback in resolveProtoPaths.
+  const binaryDir = path.dirname(path.resolve(outfile));
+  const protoSrc = path.join(import.meta.dir, "../proto");
+  const protoDest = path.join(binaryDir, "proto");
+  fs.cpSync(protoSrc, protoDest, { recursive: true });
+  console.error(`copied proto/ → ${protoDest}`);
+}
+
 process.exit(code);

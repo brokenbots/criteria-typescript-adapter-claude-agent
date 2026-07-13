@@ -44,9 +44,8 @@ The adapter reads the following secrets via `helpers.secrets.get()`. Configure t
 
 | Secret | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | **yes** | API key for Anthropic first-party access |
+| `ANTHROPIC_API_KEY` | no | API key for Anthropic first-party access. If unset, the Claude Code CLI falls back to its own stored credentials (e.g. `claude` login / OAuth). |
 | `ANTHROPIC_AUTH_TOKEN` | no | Alternative auth token (e.g. for Bedrock / Vertex via proxy) |
-| `ANTHROPIC_BASE_URL` | no | Override the API base URL |
 
 ### Adapter Config Fields
 
@@ -59,6 +58,7 @@ Declared on the `adapter` block. Shared across all steps that use this adapter i
 | `system_prompt` | string | no | Additional system prompt for every execute call. The outcome instructions are always appended after it. |
 | `thinking` | boolean | no | Enable adaptive thinking mode (`true`/`false`). |
 | `claude_executable` | string | no | Path to the Claude Code CLI. Defaults to `claude` on `PATH`. |
+| `base_url` | string | no | Override the Anthropic API base URL. Falls back to the `ANTHROPIC_BASE_URL` environment variable. |
 
 ### Step Input Fields
 
