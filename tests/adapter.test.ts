@@ -145,7 +145,27 @@ async function executeWithOutputs(
     permStream.on("error", () => {});
   });
 
-  return { outcome: result.outcome ?? "", outputs: result.outputs ?? {} };
+  // The SDK's ExecuteResult carries outputs in either the legacy
+  // map<string,string> `outputs` field (pre v2 typed-outputs cutover) or the
+  // JSON-encoded `outputsJson` bytes field (post cutover). Read both so this
+  // helper works against either SDK revision — the SDK on the
+  // chore/publish-github-packages branch still uses `outputs`, while the SDK
+  // on `main` (used by CI) uses `outputsJson`.
+  let outputs: Record<string, unknown> = {};
+  if (result.outputs && Object.keys(result.outputs).length > 0) {
+    outputs = result.outputs;
+  } else if (result.outputsJson) {
+    const buf = Buffer.isBuffer(result.outputsJson)
+      ? result.outputsJson
+      : Buffer.from(result.outputsJson);
+    try {
+      outputs = JSON.parse(buf.toString("utf8"));
+    } catch {
+      outputs = {};
+    }
+  }
+
+  return { outcome: result.outcome ?? "", outputs: outputs as Record<string, string> };
 }
 
 const adapterPath = new URL("../index.ts", import.meta.url).href;
