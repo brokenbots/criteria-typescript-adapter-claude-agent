@@ -569,4 +569,82 @@ describe("claude-agent adapter v2", () => {
     const mod = await import(`${adapterPath}?${Date.now()}`);
     expect(mod.adapterConfig.output_schema.fields).not.toHaveProperty("outcome");
   });
+
+  test("reason output is declared and not marked sensitive", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const reasonField = mod.adapterConfig.output_schema.fields.reason;
+    expect(reasonField).toBeDefined();
+    expect(reasonField.type).toBe("string");
+    expect(reasonField.sensitive).toBeFalsy();
+  });
+
+  test("held secret echoed into reason is redacted to a placeholder", async () => {
+    const secretApiKey = "sk-ant-api03-held-secret-12345";
+    const secretAuthToken = "sk-ant-auth03-held-secret-67890";
+    const rawReason = `I used key ${secretApiKey} and token ${secretAuthToken} during my work.`;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", rawReason),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({
+      config: { claude_executable: FAKE_CLI },
+      secrets: {
+        ANTHROPIC_API_KEY: secretApiKey,
+        ANTHROPIC_AUTH_TOKEN: secretAuthToken,
+      },
+    });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "redact-secrets",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(outcome).toBe("success");
+    expect(outputs.reason).not.toContain(secretApiKey);
+    expect(outputs.reason).not.toContain(secretAuthToken);
+    expect(outputs.reason).toContain("[REDACTED]");
+    expect(outputs.reason).toBe(
+      "I used key [REDACTED] and token [REDACTED] during my work."
+    );
+    await host.stop();
+  });
+
+  test("reason is passed through unchanged when it contains no held secret", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", "Task completed successfully."),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({
+      config: { claude_executable: FAKE_CLI },
+      secrets: {
+        ANTHROPIC_API_KEY: "a-different-secret-value",
+      },
+    });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "passthrough-reason",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(outcome).toBe("success");
+    expect(outputs.reason).toBe("Task completed successfully.");
+    await host.stop();
+  });
 });
