@@ -62,12 +62,49 @@ const ENV_PASSTHROUGH = [
 const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
 
 /**
+ * Placeholder used when a secret value the adapter holds appears in the
+ * agent-authored `reason` text. The replacement is visible so readers can see
+ * that something was removed, rather than silently dropping it.
+ */
+const REDACTED_PLACEHOLDER = "[REDACTED]";
+
+/**
  * Calling `submit_outcome` is model behaviour, not a guarantee — the agent
  * regularly answers a conversational prompt and stops. Re-prompt it this many
  * times before giving up and taking the fallback outcome.
  */
 const MAX_FINALIZE_ATTEMPTS = 3;
 const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
+
+// ============================================================================
+// Output sanitization
+// ============================================================================
+
+/**
+ * Best-effort redaction of secret values the adapter actually holds.
+ *
+ * This only removes verbatim occurrences of secrets the adapter has received
+ * (currently ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN). It does not do
+ * general-purpose secret detection, PII scrubbing, or entropy heuristics,
+ * because those produce false positives that corrupt legitimate agent prose.
+ * An agent's explanation may still contain other repository or user content;
+ * consumers must decide where to route it.
+ */
+function sanitizeReason(reason: string, secrets: (string | undefined)[]): string {
+  const toRedact = secrets
+    .filter((s): s is string => typeof s === "string" && s.length > 0)
+    // Longer secrets first so a shorter value cannot slice a longer one.
+    .sort((a, b) => b.length - a.length);
+
+  let sanitized = reason;
+  for (const value of toRedact) {
+    // Escape regex metacharacters so the secret is matched literally.
+    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(escaped, "g");
+    sanitized = sanitized.replace(pattern, REDACTED_PLACEHOLDER);
+  }
+  return sanitized;
+}
 
 // ============================================================================
 // MCP Server
@@ -79,7 +116,7 @@ interface OutcomeCapture {
   finalized: boolean;
 }
 
-function buildOutcomeMcpServer(allowedOutcomes: string[], capture: OutcomeCapture) {
+function buildOutcomeMcpServer(allowedOutcomes: string[], capture: OutcomeCapture, heldSecrets: (string | undefined)[]) {
   const outcomeSchema =
     allowedOutcomes.length > 0
       ? z
@@ -145,7 +182,7 @@ function buildOutcomeMcpServer(allowedOutcomes: string[], capture: OutcomeCaptur
             content: [
               { type: "text", text: `Outcome "${outcome}" recorded successfully. Workflow will proceed.` },
             ],
-            metadata: { outcome, reason },
+            metadata: { outcome, reason: sanitizeReason(reason, heldSecrets) },
           };
         },
       },
@@ -349,8 +386,14 @@ async function executeStep(
 
   await helpers.log.stdout("[claude-agent] Starting agent query...\n");
 
+  // Secrets the adapter actually holds and therefore must redact from any
+  // agent-authored output before returning it to the workflow.
+  const apiKey = (await helpers.secrets.get("ANTHROPIC_API_KEY")) ?? undefined;
+  const authToken = (await helpers.secrets.get("ANTHROPIC_AUTH_TOKEN")) ?? undefined;
+  const heldSecrets = [apiKey, authToken];
+
   const capture: OutcomeCapture = { outcome: null, reason: "", finalized: false };
-  const mcpServer = buildOutcomeMcpServer(allowedOutcomes, capture);
+  const mcpServer = buildOutcomeMcpServer(allowedOutcomes, capture, heldSecrets);
   const abortController = new AbortController();
 
   // Per-step `input.cwd` overrides the adapter-level `config.cwd`.
@@ -368,13 +411,11 @@ async function executeStep(
     );
   }
 
-  const apiKey = (await helpers.secrets.get("ANTHROPIC_API_KEY")) ?? undefined;
   // base_url is a config field (not a secret): precedence is config, then the
   // ANTHROPIC_BASE_URL environment variable. It is not in ENV_PASSTHROUGH, so
   // the env var only reaches the subprocess if we forward it explicitly below.
   const baseURL =
     helpers.session.get<string>("baseUrl") || process.env.ANTHROPIC_BASE_URL || undefined;
-  const authToken = (await helpers.secrets.get("ANTHROPIC_AUTH_TOKEN")) ?? undefined;
 
   const buildOptions = (resume: string | undefined) => ({
     abortController,
@@ -438,12 +479,15 @@ async function executeStep(
 
   // Determine outcome from capture
   if (capture.outcome) {
-    await helpers.outcomes.finalize(capture.outcome, { reason: capture.reason });
+    await helpers.outcomes.finalize(capture.outcome, { reason: sanitizeReason(capture.reason, heldSecrets) });
     return;
   }
 
   // No outcome was submitted, even after re-prompting
-  const reason = `Agent completed without submitting an outcome after ${attempts} re-prompt(s)`;
+  const reason = sanitizeReason(
+    `Agent completed without submitting an outcome after ${attempts} re-prompt(s)`,
+    heldSecrets
+  );
   if (allowedOutcomes.includes("needs_review")) {
     await helpers.outcomes.finalize("needs_review", { reason });
   } else {
@@ -502,8 +546,12 @@ export const adapterConfig = {
       reason: {
         type: "string",
         required: false,
-        description: "Optional reason or explanation returned by the agent when it calls submit_outcome. May contain repository or user content.",
-        sensitive: true,
+        description:
+          "Agent-authored prose returned when the agent calls submit_outcome. " +
+          "May include repository or user content. " +
+          "Before returning, the adapter redacts verbatim occurrences of any secret value it holds " +
+          `(currently ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN), replacing them with "${REDACTED_PLACEHOLDER}". ` +
+          "This is best-effort hygiene: general secret detection is not performed, so the text is not guaranteed to be free of sensitive material.",
       },
     },
   },
