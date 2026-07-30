@@ -497,6 +497,17 @@ export const adapterConfig = {
     },
   },
 
+  output_schema: {
+    fields: {
+      reason: {
+        type: "string",
+        required: false,
+        description: "Optional reason or explanation returned by the agent when it calls submit_outcome. May contain repository or user content.",
+        sensitive: true,
+      },
+    },
+  },
+
   async openSession(req: any, helpers: Helpers) {
     // Store adapter-level config in session
     helpers.session.set("model", req.config.model || undefined);

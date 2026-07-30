@@ -43,6 +43,111 @@ class MockMcpServer {
   }
 }
 
+/**
+ * Simulates an agent run that calls `submit_outcome` with the given outcome and
+ * reason. The real SDK would invoke the MCP tool internally; this mock looks up
+ * the tool in the supplied MCP server and calls its handler directly, which is
+ * exactly what the adapter observes.
+ */
+class MockQueryWithOutcome implements AsyncIterable<any> {
+  private opts: any;
+  private outcome: string;
+  private reason: string;
+
+  constructor(opts: any, outcome: string, reason: string) {
+    this.opts = opts;
+    this.outcome = outcome;
+    this.reason = reason;
+  }
+
+  async *[Symbol.asyncIterator]() {
+    const { mcpServers, allowedTools } = this.opts.options || {};
+    if (mcpServers && allowedTools) {
+      for (const toolRef of allowedTools) {
+        const parts = toolRef.split("__");
+        const toolName = parts[parts.length - 1];
+        if (toolName !== "submit_outcome") continue;
+
+        const serverName = Object.keys(mcpServers)[0];
+        const server = mcpServers[serverName];
+        const tool = server?.tools?.find((t: any) => t.name === "submit_outcome");
+        if (tool?.handler) {
+          await tool.handler({ outcome: this.outcome, reason: this.reason });
+        }
+      }
+    }
+    yield { type: "result", subtype: "success", result: "done", duration_ms: 100, num_turns: 1, total_cost_usd: 0 };
+  }
+
+  close() {}
+  async interrupt() {}
+}
+
+/**
+ * Execute a step through a TestHost and return the full outputs map exposed by
+ * the wire result event. TestHost only exposes `reason` on its friendly return
+ * value, so we talk to the underlying gRPC client to capture the exact key set.
+ */
+async function executeWithOutputs(
+  host: TestHost,
+  opts: {
+    stepName: string;
+    input?: Record<string, unknown>;
+    allowedOutcomes?: string[];
+  }
+): Promise<{ outcome: string; outputs: Record<string, string> }> {
+  const client = (host as any).client;
+  const sessionId = (host as any).sessionId;
+  const autoGrant = (host as any)._autoGrantPermissions ?? false;
+  const delayMs = (host as any)._permissionDelayMs ?? 0;
+  if (!client || !sessionId) throw new Error("Host not started or session not open");
+
+  const permStream = (host as any)._permStream ?? (client as any).Permissions();
+  (host as any)._permStream = permStream;
+
+  const result: any = await new Promise((resolve, reject) => {
+    let resolved = false;
+    const execStream = (client as any).Execute({
+      sessionId,
+      stepName: opts.stepName,
+      input: opts.input ?? {},
+      allowedOutcomes: opts.allowedOutcomes ?? [],
+    });
+
+    execStream.on("data", (evt: any) => {
+      if (resolved) return;
+      if (evt.result) {
+        resolved = true;
+        resolve(evt.result);
+        return;
+      }
+      const adapterEvt = evt.adapter as Record<string, unknown> | undefined;
+      if (adapterEvt?.eventKind === "permission.request") {
+        const payload = adapterEvt.payload as Record<string, any> | undefined;
+        const reqId = payload?.fields?.requestId?.stringValue as string | undefined;
+        if (reqId && autoGrant) {
+          if (delayMs > 0) {
+            setTimeout(() => permStream.write({ request: { requestId: reqId } }), delayMs);
+          } else {
+            permStream.write({ request: { requestId: reqId } });
+          }
+        }
+      }
+    });
+
+    execStream.on("error", (err: any) => {
+      if (!resolved) reject(err);
+    });
+    execStream.on("end", () => {
+      if (!resolved) reject(new Error("Execute stream ended without result"));
+    });
+    permStream.on("data", () => {});
+    permStream.on("error", () => {});
+  });
+
+  return { outcome: result.outcome ?? "", outputs: result.outputs ?? {} };
+}
+
 const adapterPath = new URL("../index.ts", import.meta.url).href;
 
 // The adapter resolves the Claude Code CLI up front and refuses to run without
@@ -358,5 +463,90 @@ describe("claude-agent adapter v2", () => {
     expect(permissionCount).toBe(50);
     expect(["success", "failure", "needs_review"]).toContain(result.outcome);
     await host.stop();
+  });
+
+  test("declared output_schema keys match emitted outputs when agent submits outcome", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", "Task completed successfully."),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "submit-outcome-outputs",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(outcome).toBe("success");
+    expect(Object.keys(outputs).sort()).toEqual(Object.keys(mod.adapterConfig.output_schema.fields).sort());
+    expect(outputs.reason).toBe("Task completed successfully.");
+    await host.stop();
+  });
+
+  test("declared output_schema keys match emitted outputs on fallback path", async () => {
+    // The default MockQuery never calls submit_outcome, so the adapter takes
+    // the fallback path after re-prompting.
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQuery(opts),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "fallback-outputs",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(["failure", "needs_review"]).toContain(outcome);
+    expect(Object.keys(outputs).sort()).toEqual(Object.keys(mod.adapterConfig.output_schema.fields).sort());
+    expect(outputs.reason).toContain("Agent completed without submitting an outcome");
+    await host.stop();
+  });
+
+  test("declared output_schema types match emitted types", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", "Typed reason value"),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outputs } = await executeWithOutputs(host, {
+      stepName: "type-check-outputs",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    const declaredType = mod.adapterConfig.output_schema.fields.reason?.type;
+    expect(declaredType).toBe("string");
+    expect(typeof outputs.reason).toBe("string");
+    await host.stop();
+  });
+
+  test("adapter does not declare outcome as a step output", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    expect(mod.adapterConfig.output_schema.fields).not.toHaveProperty("outcome");
   });
 });
