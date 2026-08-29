@@ -16,16 +16,18 @@
   "dependencies": {
     "@criteria/adapter-sdk": "file:../criteria-typescript-adapter-sdk",
     "@anthropic-ai/claude-agent-sdk": "^0.2.141",
-    "zod": "^4.4.3"
+    "zod": "^4.5.2"
   },
   "trustedDependencies": [
     "protobufjs"
   ],
   "overrides": {
     "@grpc/grpc-js": "^1.14.4",
-    "brace-expansion": "^5.0.8",
-    "hono": "^4.12.25",
+    "brace-expansion": "^5.0.9",
+    "fast-uri": "^3.1.5",
+    "hono": "^4.12.34",
     "ip-address": "^10.1.1",
+    "js-yaml": "^4.3.1",
     "minimatch": "^10.2.6",
     "protobufjs": "^7.6.3",
     "qs": "^6.15.2"
