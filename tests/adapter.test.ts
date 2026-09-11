@@ -124,7 +124,9 @@ async function executeWithOutputs(
       const adapterEvt = evt.adapter as Record<string, unknown> | undefined;
       if (adapterEvt?.eventKind === "permission.request") {
         const payload = adapterEvt.payload as Record<string, any> | undefined;
-        const reqId = payload?.fields?.requestId?.stringValue as string | undefined;
+        const reqId =
+          (payload?.fields?.request_id?.stringValue as string | undefined) ??
+          (payload?.fields?.requestId?.stringValue as string | undefined);
         if (reqId && autoGrant) {
           if (delayMs > 0) {
             setTimeout(() => permStream.write({ request: { requestId: reqId } }), delayMs);
@@ -151,6 +153,78 @@ async function executeWithOutputs(
   // helper works against either SDK revision — the SDK on the
   // chore/publish-github-packages branch still uses `outputs`, while the SDK
   // on `main` (used by CI) uses `outputsJson`.
+  let outputs: Record<string, unknown> = {};
+  if (result.outputs && Object.keys(result.outputs).length > 0) {
+    outputs = result.outputs;
+  } else if (result.outputsJson) {
+    const buf = Buffer.isBuffer(result.outputsJson)
+      ? result.outputsJson
+      : Buffer.from(result.outputsJson);
+    try {
+      outputs = JSON.parse(buf.toString("utf8"));
+    } catch {
+      outputs = {};
+    }
+  }
+
+  return { outcome: result.outcome ?? "", outputs: outputs as Record<string, string> };
+}
+
+/**
+ * Execute a step through a TestHost without auto-granting permissions. The
+ * caller receives the snake_case request_id from each permission.request event
+ * and the Permissions stream so it can manually grant or deny.
+ */
+async function executeWithManualPermission(
+  host: TestHost,
+  opts: {
+    stepName: string;
+    input?: Record<string, unknown>;
+    allowedOutcomes?: string[];
+    onRequest: (requestId: string, permStream: any, payload: Record<string, any>) => void;
+  }
+): Promise<{ outcome: string; outputs: Record<string, string> }> {
+  const client = (host as any).client;
+  const sessionId = (host as any).sessionId;
+  if (!client || !sessionId) throw new Error("Host not started or session not open");
+
+  const permStream = (host as any)._permStream ?? (client as any).Permissions();
+  (host as any)._permStream = permStream;
+
+  const result: any = await new Promise((resolve, reject) => {
+    let resolved = false;
+    const execStream = (client as any).Execute({
+      sessionId,
+      stepName: opts.stepName,
+      input: opts.input ?? {},
+      allowedOutcomes: opts.allowedOutcomes ?? [],
+    });
+
+    execStream.on("data", (evt: any) => {
+      if (resolved) return;
+      if (evt.result) {
+        resolved = true;
+        resolve(evt.result);
+        return;
+      }
+      const adapterEvt = evt.adapter as Record<string, unknown> | undefined;
+      if (adapterEvt?.eventKind === "permission.request") {
+        const payload = adapterEvt.payload as Record<string, any> | undefined;
+        const reqId = payload?.fields?.request_id?.stringValue as string | undefined;
+        if (reqId) opts.onRequest(reqId, permStream, payload);
+      }
+    });
+
+    execStream.on("error", (err: any) => {
+      if (!resolved) reject(err);
+    });
+    execStream.on("end", () => {
+      if (!resolved) reject(new Error("Execute stream ended without result"));
+    });
+    permStream.on("data", () => {});
+    permStream.on("error", () => {});
+  });
+
   let outputs: Record<string, unknown> = {};
   if (result.outputs && Object.keys(result.outputs).length > 0) {
     outputs = result.outputs;
@@ -482,6 +556,153 @@ describe("claude-agent adapter v2", () => {
 
     expect(permissionCount).toBe(50);
     expect(["success", "failure", "needs_review"]).toContain(result.outcome);
+    await host.stop();
+  });
+
+  test("permission.request event payload includes non-empty snake_case request_id matching internal id", async () => {
+    let capturedSnake: string | undefined;
+    let capturedCamel: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            const result = await canUseTool("Bash", { command: "git --version" }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-1",
+            });
+            expect(result.behavior).toBe("allow");
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "request-id-check",
+      input: { prompt: "run git" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream, payload) => {
+        capturedSnake = reqId;
+        capturedCamel = payload?.fields?.requestId?.stringValue as string | undefined;
+        permStream.write({ request: { requestId: reqId } });
+      },
+    });
+
+    expect(capturedSnake).toBeDefined();
+    expect(capturedSnake?.length).toBeGreaterThan(0);
+    expect(capturedCamel).toBe(capturedSnake);
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
+    await host.stop();
+  });
+
+  test("host permission.granted with matching request_id resolves to allow in under 1 second", async () => {
+    let canUseToolStart = 0;
+    let canUseToolEnd = 0;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            canUseToolStart = Date.now();
+            const result = await canUseTool("Bash", { command: "git --version" }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-1",
+            });
+            canUseToolEnd = Date.now();
+            expect(result.behavior).toBe("allow");
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "grant-latency",
+      input: { prompt: "run git" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream) => {
+        permStream.write({ request: { requestId: reqId } });
+      },
+    });
+
+    expect(canUseToolEnd).toBeGreaterThan(0);
+    expect(canUseToolEnd - canUseToolStart).toBeLessThan(1000);
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
+    await host.stop();
+  });
+
+  test("host permission.denied with matching request_id resolves to deny in under 1 second", async () => {
+    let canUseToolStart = 0;
+    let canUseToolEnd = 0;
+    let capturedBehavior: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            canUseToolStart = Date.now();
+            const result = await canUseTool("Bash", { command: "git --version" }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-1",
+            });
+            canUseToolEnd = Date.now();
+            capturedBehavior = result.behavior;
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "deny-latency",
+      input: { prompt: "run git" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream) => {
+        permStream.write({ cancel: { requestId: reqId, reason: "denied by test" } });
+      },
+    });
+
+    expect(canUseToolEnd).toBeGreaterThan(0);
+    expect(canUseToolEnd - canUseToolStart).toBeLessThan(1000);
+    expect(capturedBehavior).toBe("deny");
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
   });
 
