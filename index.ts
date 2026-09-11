@@ -31,12 +31,22 @@
  */
 
 import { serve, serveRemote } from "@criteria/adapter-sdk";
-import { query, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Query, PermissionResult, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
-import { z } from "zod";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Helpers, ExecuteRequest } from "@criteria/adapter-sdk";
+import {
+  SUBMIT_OUTCOME_TOOL_NAME,
+  MAX_FINALIZE_ATTEMPTS,
+  REDACTED_PLACEHOLDER,
+  createOutcomeState,
+  buildOutcomeMcpServer,
+  buildOutcomeInstructions,
+  buildRepromptPrompt,
+  resolveOutcome,
+  sanitizeReason,
+} from "./outcome.js";
 
 // ============================================================================
 // Constants
@@ -67,22 +77,6 @@ const ENV_PASSTHROUGH = [
   "TMPDIR",
 ] as const;
 
-const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
-
-/**
- * Placeholder used when a secret value the adapter holds appears in the
- * agent-authored `reason` text. The replacement is visible so readers can see
- * that something was removed, rather than silently dropping it.
- */
-const REDACTED_PLACEHOLDER = "[REDACTED]";
-
-/**
- * Calling `submit_outcome` is model behaviour, not a guarantee — the agent
- * regularly answers a conversational prompt and stops. Re-prompt it this many
- * times before giving up and taking the fallback outcome.
- */
-const MAX_FINALIZE_ATTEMPTS = 3;
-const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
 
 const VALID_REASONING_EFFORTS = ["none", "low", "medium", "high"] as const;
 type ReasoningEffort = (typeof VALID_REASONING_EFFORTS)[number];
@@ -181,114 +175,37 @@ function thinkingConfigFromReasoningEffort(
 // Output sanitization
 // ============================================================================
 
+// ============================================================================
+// Timeout resolution
+// ============================================================================
+
 /**
- * Best-effort redaction of secret values the adapter actually holds.
- *
- * This only removes verbatim occurrences of secrets the adapter has received
- * (currently ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN). It does not do
- * general-purpose secret detection, PII scrubbing, or entropy heuristics,
- * because those produce false positives that corrupt legitimate agent prose.
- * An agent's explanation may still contain other repository or user content;
- * consumers must decide where to route it.
+ * Validate a timeout value from config or per-step input. Returns undefined
+ * when the input is undefined/null/empty/zero. Throws a clear error for
+ * unsupported values. Negative values are rejected; non-integer numbers are
+ * accepted but rounded to milliseconds.
  */
-function sanitizeReason(reason: string, secrets: (string | undefined)[]): string {
-  const toRedact = secrets
-    .filter((s): s is string => typeof s === "string" && s.length > 0)
-    // Longer secrets first so a shorter value cannot slice a longer one.
-    .sort((a, b) => b.length - a.length);
-
-  let sanitized = reason;
-  for (const value of toRedact) {
-    // Escape regex metacharacters so the secret is matched literally.
-    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = new RegExp(escaped, "g");
-    sanitized = sanitized.replace(pattern, REDACTED_PLACEHOLDER);
+function resolveTimeoutMs(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
   }
-  return sanitized;
-}
-
-// ============================================================================
-// MCP Server
-// ============================================================================
-
-interface OutcomeCapture {
-  outcome: string | null;
-  reason: string;
-  finalized: boolean;
-}
-
-function buildOutcomeMcpServer(allowedOutcomes: string[], capture: OutcomeCapture, heldSecrets: (string | undefined)[]) {
-  const outcomeSchema =
-    allowedOutcomes.length > 0
-      ? z
-          .enum(allowedOutcomes as [string, ...string[]])
-          .describe(`The outcome to submit. Must be one of: ${allowedOutcomes.join(", ")}`)
-      : z.string().describe("The outcome name to finalize.");
-
-  return createSdkMcpServer({
-    name: "criteria-workflow",
-    // Without this the tool is deferred behind tool search, so the agent never
-    // sees `submit_outcome` in its prompt and the step cannot be finalized.
-    alwaysLoad: true,
-    tools: [
-      {
-        name: SUBMIT_OUTCOME_TOOL_NAME,
-        description: SUBMIT_OUTCOME_DESCRIPTION,
-        inputSchema: {
-          outcome: outcomeSchema,
-          reason: z.string().optional().describe("Optional reason or explanation for the outcome."),
-        },
-        annotations: { readOnlyHint: false, destructiveHint: false },
-        handler: async (args: any) => {
-          const outcome = args.outcome?.trim() as string | undefined;
-          const reason = (args.reason?.trim() as string | undefined) || "";
-
-          if (!outcome) {
-            return {
-              content: [{ type: "text", text: "Outcome is required. Please provide a valid outcome name." }],
-              isError: true,
-            };
-          }
-
-          if (!allowedOutcomes.includes(outcome)) {
-            if (allowedOutcomes.length === 0) {
-              return {
-                content: [{ type: "text", text: "No outcomes are declared for this step." }],
-                isError: true,
-              };
-            }
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Outcome "${outcome}" is not allowed. Choose one of: ${allowedOutcomes.join(", ")}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-
-          if (capture.finalized) {
-            return {
-              content: [{ type: "text", text: `Outcome already finalized as "${capture.outcome}".` }],
-              isError: true,
-            };
-          }
-
-          capture.outcome = outcome;
-          capture.reason = reason;
-          capture.finalized = true;
-
-          return {
-            content: [
-              { type: "text", text: `Outcome "${outcome}" recorded successfully. Workflow will proceed.` },
-            ],
-            metadata: { outcome, reason: sanitizeReason(reason, heldSecrets) },
-          };
-        },
-      },
-    ],
-  });
+  let numeric: number;
+  if (typeof value === "number") {
+    numeric = value;
+  } else if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") return undefined;
+    numeric = Number(trimmed);
+    if (!Number.isFinite(numeric)) {
+      throw new Error(`Invalid timeout ${JSON.stringify(value)}: must be a finite number of milliseconds.`);
+    }
+  } else {
+    throw new Error(`Invalid timeout ${JSON.stringify(value)}: must be a number of milliseconds.`);
+  }
+  if (numeric <= 0) {
+    throw new Error(`Invalid timeout ${numeric}: must be a positive number of milliseconds.`);
+  }
+  return numeric;
 }
 
 // ============================================================================
@@ -384,8 +301,6 @@ async function handleMessageStream(
   helpers: Helpers,
   q: Query,
   state: {
-    finalizedOutcome: string | null;
-    finalizedReason: string;
     lastResultText: string;
     claudeSessionId: string | null;
   }
@@ -479,16 +394,11 @@ async function executeStep(
   }
 
   // Reset per-execution state
-  let finalizedOutcome: string | null = null;
-  let finalizedReason = "";
   let lastResultText = "";
   let claudeSessionId = helpers.session.get<string | null>("claudeSessionId") ?? null;
 
   const allowedOutcomes = req.allowedOutcomes ?? [];
-  const outcomeInstructions =
-    allowedOutcomes.length > 0
-      ? `You are integrated into a workflow system. When you have completed your task, you MUST call the \`${SUBMIT_OUTCOME_TOOL_NAME}\` tool to finalize the step. The allowed outcomes are: ${allowedOutcomes.join(", ")}. Do not stop or explain that you are done — just call the tool.`
-      : `You are integrated into a workflow system.`;
+  const outcomeInstructions = buildOutcomeInstructions(allowedOutcomes);
 
   // The outcome instructions are always appended: without them the agent never
   // learns that `submit_outcome` exists and the step can only fail.
@@ -505,9 +415,24 @@ async function executeStep(
   const authToken = (await helpers.secrets.get("ANTHROPIC_AUTH_TOKEN")) ?? undefined;
   const heldSecrets = [apiKey, authToken];
 
-  const capture: OutcomeCapture = { outcome: null, reason: "", finalized: false };
-  const mcpServer = buildOutcomeMcpServer(allowedOutcomes, capture, heldSecrets);
+  const outcomeState = createOutcomeState();
+  const mcpServer = buildOutcomeMcpServer({ allowedOutcomes, capture: outcomeState, heldSecrets, helpers });
   const abortController = new AbortController();
+
+  // Configure a per-step timeout. Precedence: per-step input, session config,
+  // then no timeout. A positive timeout aborts the query and forces a timeout
+  // outcome if the agent never calls submit_outcome in time.
+  const timeoutMs =
+    resolveTimeoutMs(req.input.timeout_ms as unknown) ??
+    helpers.session.get<number>("stepTimeoutMs") ??
+    undefined;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs !== undefined) {
+    timeoutHandle = setTimeout(() => {
+      outcomeState.timedOut = true;
+      abortController.abort(new Error(`Outcome capture timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  }
 
   // Per-step `input.cwd` overrides the adapter-level `config.cwd`.
   const cwd = req.input.cwd || helpers.session.get<string>("cwd") || process.cwd();
@@ -556,59 +481,66 @@ async function executeStep(
     },
   });
 
-  const state = { finalizedOutcome, finalizedReason, lastResultText, claudeSessionId };
+  const streamState = { lastResultText, claudeSessionId };
 
-  const runQuery = async (prompt: string, resume: string | undefined) => {
+  const runQuery = async (queryPrompt: string, resume: string | undefined) => {
     try {
-      await handleMessageStream(helpers, query({ prompt, options: buildOptions(resume) }), state);
+      await handleMessageStream(
+        helpers,
+        query({ prompt: queryPrompt, options: buildOptions(resume) }),
+        streamState
+      );
     } catch (e) {
-      await helpers.log.stderr(`[claude-agent] Query error: ${e}\n`);
+      const err = e instanceof Error ? e : new Error(String(e));
+      // A timeout abort is expected and already recorded on the state; other
+      // errors are terminal agent failures.
+      if (!outcomeState.timedOut) {
+        outcomeState.error = err;
+      }
+      await helpers.log.stderr(`[claude-agent] Query error: ${err.message}\n`);
     } finally {
       // Persist session ID for resume
-      helpers.session.set("claudeSessionId", state.claudeSessionId);
-      helpers.session.set("lastResultText", state.lastResultText);
+      helpers.session.set("claudeSessionId", streamState.claudeSessionId);
+      helpers.session.set("lastResultText", streamState.lastResultText);
     }
   };
 
   await runQuery(prompt, claudeSessionId || undefined);
 
   // The agent often answers and stops without finalizing. Re-prompt it in the
-  // same session, resuming so it keeps the conversation context.
-  let attempts = 0;
+  // same session, resuming so it keeps the conversation context. We count the
+  // initial query as attempt 1 and allow up to MAX_FINALIZE_ATTEMPTS total
+  // attempts, matching the copilot adapter behavior (1 initial + 2 reprompts).
+  let attempts = 1;
   while (
-    !capture.finalized &&
+    !outcomeState.finalized &&
+    !outcomeState.timedOut &&
+    !outcomeState.error &&
     allowedOutcomes.length > 0 &&
-    state.claudeSessionId &&
+    streamState.claudeSessionId &&
     attempts < MAX_FINALIZE_ATTEMPTS
   ) {
-    attempts++;
+    const nextAttempt = attempts + 1;
     await helpers.log.adapterEvent("outcome.reprompt", {
-      attempt: attempts,
+      attempt: nextAttempt,
       maxAttempts: MAX_FINALIZE_ATTEMPTS,
     });
-    await runQuery(
-      `You have not finalized this workflow step. Call the \`${SUBMIT_OUTCOME_TOOL_NAME}\` tool now with one of: ${allowedOutcomes.join(", ")}. Respond with the tool call only.`,
-      state.claudeSessionId
-    );
+    await runQuery(buildRepromptPrompt(allowedOutcomes), streamState.claudeSessionId);
+    attempts = nextAttempt;
   }
 
-  // Determine outcome from capture
-  if (capture.outcome) {
-    await helpers.outcomes.finalize(capture.outcome, { reason: sanitizeReason(capture.reason, heldSecrets) });
-    return;
+  if (timeoutHandle) {
+    clearTimeout(timeoutHandle);
   }
 
-  // No outcome was submitted, even after re-prompting
-  const reason = sanitizeReason(
-    `Agent completed without submitting an outcome after ${attempts} re-prompt(s)`,
-    heldSecrets
-  );
-  if (allowedOutcomes.includes("needs_review")) {
-    await helpers.outcomes.finalize("needs_review", { reason });
-  } else {
-    await helpers.log.adapterEvent("outcome.failure", { reason: "missing submit_outcome", attempts });
-    await helpers.outcomes.finalize("failure", { reason });
-  }
+  const resolved = await resolveOutcome({
+    state: outcomeState,
+    allowedOutcomes,
+    attempts,
+    helpers,
+    heldSecrets,
+  });
+  await helpers.outcomes.finalize(resolved.outcome, { reason: resolved.reason });
 }
 
 // ============================================================================
@@ -647,6 +579,7 @@ export const adapterConfig = {
       thinking: { type: "boolean", required: false, description: "Deprecated. Use reasoning_effort instead. `true` maps to high, `false` to none." },
       claude_executable: { type: "string", required: false, description: "Path to the Claude Code CLI. Defaults to `claude` on PATH." },
       base_url: { type: "string", required: false, description: "Override the Anthropic API base URL. Falls back to the ANTHROPIC_BASE_URL environment variable." },
+      step_timeout_ms: { type: "number", required: false, description: "Maximum time in milliseconds to wait for the agent to submit an outcome. When exceeded, the adapter aborts the query and emits a timeout outcome. No timeout when unset." },
     },
   },
 
@@ -655,6 +588,7 @@ export const adapterConfig = {
       prompt: { type: "string", required: true, description: "The task prompt to send to Claude Code" },
       model: { type: "string", required: false, description: "Per-step model override" },
       cwd: { type: "string", required: false, description: "Per-step working directory override. Takes precedence over config.cwd." },
+      timeout_ms: { type: "number", required: false, description: "Per-step override for the maximum time in milliseconds to wait for an outcome. Takes precedence over config.step_timeout_ms." },
     },
   },
 
@@ -693,6 +627,7 @@ export const adapterConfig = {
     helpers.session.set("reasoningEffort", reasoningEffort || undefined);
     helpers.session.set("claudeExecutable", req.config.claude_executable || undefined);
     helpers.session.set("baseUrl", req.config.base_url || undefined);
+    helpers.session.set("stepTimeoutMs", resolveTimeoutMs(req.config.step_timeout_ms as unknown) ?? undefined);
     helpers.session.set(
       "systemPromptAppend",
       req.config.system_prompt
@@ -717,6 +652,7 @@ export const adapterConfig = {
       systemPromptAppend: helpers.session.get<string>("systemPromptAppend") ?? undefined,
       baseUrl: helpers.session.get<string>("baseUrl") ?? undefined,
       claudeExecutable: helpers.session.get<string>("claudeExecutable") ?? undefined,
+      stepTimeoutMs: helpers.session.get<number>("stepTimeoutMs") ?? undefined,
     };
     const state = new TextEncoder().encode(JSON.stringify(payload));
     return { state, schemaVersion: 1 };
@@ -740,6 +676,7 @@ export const adapterConfig = {
     helpers.session.set("systemPromptAppend", snapshot.systemPromptAppend as string | undefined);
     helpers.session.set("baseUrl", snapshot.baseUrl as string | undefined);
     helpers.session.set("claudeExecutable", snapshot.claudeExecutable as string | undefined);
+    helpers.session.set("stepTimeoutMs", snapshot.stepTimeoutMs as number | undefined);
   },
 };
 
