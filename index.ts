@@ -32,7 +32,7 @@
 
 import { serve, serveRemote } from "@criteria/adapter-sdk";
 import { query, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
-import type { Query, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, PermissionResult, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -83,6 +83,88 @@ const REDACTED_PLACEHOLDER = "[REDACTED]";
  */
 const MAX_FINALIZE_ATTEMPTS = 3;
 const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
+
+const VALID_REASONING_EFFORTS = ["none", "low", "medium", "high"] as const;
+type ReasoningEffort = (typeof VALID_REASONING_EFFORTS)[number];
+
+const REASONING_EFFORT_BUDGET_TOKENS: Record<ReasoningEffort, number> = {
+  none: 0,
+  low: 4096,
+  medium: 16384,
+  high: 65536,
+};
+
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === "string" && VALID_REASONING_EFFORTS.includes(value as ReasoningEffort);
+}
+
+/**
+ * Validate and normalize a reasoning_effort value. Returns undefined when the
+ * input is undefined/null/empty. Throws a clear error for unsupported values.
+ */
+function validateReasoningEffort(value: unknown): ReasoningEffort | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (isReasoningEffort(value)) {
+    return value;
+  }
+  throw new Error(
+    `Invalid reasoning_effort ${JSON.stringify(value)}. Valid values: ${VALID_REASONING_EFFORTS.join(", ")}.`
+  );
+}
+
+/**
+ * Validate a model identifier. Returns undefined when the input is undefined/
+ * null/empty. Trims whitespace and rejects empty or malformed identifiers.
+ */
+function validateModel(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`Invalid model ${JSON.stringify(value)}: must be a string.`);
+  }
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    throw new Error("Invalid model: must be a non-empty string.");
+  }
+  if (!/^[a-zA-Z0-9_.\-]+$/.test(trimmed)) {
+    throw new Error(
+      `Invalid model ${JSON.stringify(trimmed)}: must contain only letters, numbers, hyphens, underscores, and dots.`
+    );
+  }
+  return trimmed;
+}
+
+/**
+ * Convert a legacy `thinking` boolean into the reasoning_effort vocabulary.
+ * `true` maps to "high" (matching the previous adaptive-thinking default),
+ * `false` maps to "none". Returns undefined when the value is not a boolean.
+ */
+function reasoningEffortFromThinking(value: unknown): ReasoningEffort | undefined {
+  if (value === true) return "high";
+  if (value === false) return "none";
+  return undefined;
+}
+
+/**
+ * Map a reasoning_effort level to the Claude Code SDK thinking configuration.
+ * - none  -> disabled
+ * - low   -> enabled with a small token budget
+ * - medium-> enabled with a moderate token budget
+ * - high  -> enabled with a large token budget
+ */
+function thinkingConfigFromReasoningEffort(
+  effort: ReasoningEffort | undefined
+): ThinkingConfig | undefined {
+  if (effort === undefined) return undefined;
+  if (effort === "none") return { type: "disabled" as const };
+  return {
+    type: "enabled" as const,
+    budgetTokens: REASONING_EFFORT_BUDGET_TOKENS[effort],
+  };
+}
 
 // ============================================================================
 // Output sanitization
@@ -418,9 +500,11 @@ async function executeStep(
 
   // Per-step `input.cwd` overrides the adapter-level `config.cwd`.
   const cwd = req.input.cwd || helpers.session.get<string>("cwd") || process.cwd();
-  // Per-step `input.model` overrides the adapter-level `config.model`.
-  const model = req.input.model || helpers.session.get<string>("model") || undefined;
-  const thinking = helpers.session.get<boolean>("thinking") ?? false;
+  // Per-step `input.model` overrides the adapter-level `config.model`,
+  // which in turn overrides the CLI default.
+  const model = validateModel(req.input.model as unknown) ?? helpers.session.get<string>("model") ?? undefined;
+  const reasoningEffort = helpers.session.get<ReasoningEffort>("reasoningEffort") ?? undefined;
+  const thinking = thinkingConfigFromReasoningEffort(reasoningEffort);
 
   const claudeExecutable = resolveClaudeExecutable(
     helpers.session.get<string>("claudeExecutable") ?? undefined
@@ -450,7 +534,7 @@ async function executeStep(
     persistSession: true,
     resume,
     model,
-    thinking: thinking ? { type: "adaptive" as const } : undefined,
+    thinking,
     pathToClaudeCodeExecutable: claudeExecutable,
     env: {
       ...passthroughEnv(),
@@ -545,10 +629,11 @@ export const adapterConfig = {
 
   config_schema: {
     fields: {
-      model: { type: "string", required: false, description: "Model to use (e.g., claude-sonnet-4-6)" },
+      model: { type: "string", required: false, description: "Model to use (e.g., claude-sonnet-4-6). Falls back to the Claude Code CLI default." },
       cwd: { type: "string", required: false, description: "Working directory for the agent. Defaults to process.cwd()." },
       system_prompt: { type: "string", required: false, description: "Custom system prompt prepended to every execute call" },
-      thinking: { type: "boolean", required: false, description: "Enable adaptive thinking mode" },
+      reasoning_effort: { type: "string", required: false, description: "Reasoning effort for the agent: none, low, medium, or high." },
+      thinking: { type: "boolean", required: false, description: "Deprecated. Use reasoning_effort instead. `true` maps to high, `false` to none." },
       claude_executable: { type: "string", required: false, description: "Path to the Claude Code CLI. Defaults to `claude` on PATH." },
       base_url: { type: "string", required: false, description: "Override the Anthropic API base URL. Falls back to the ANTHROPIC_BASE_URL environment variable." },
     },
@@ -578,10 +663,26 @@ export const adapterConfig = {
   },
 
   async openSession(req: any, helpers: Helpers) {
-    // Store adapter-level config in session
-    helpers.session.set("model", req.config.model || undefined);
+    // Validate and store adapter-level config in session.
+    const model = validateModel(req.config.model);
+
+    // reasoning_effort takes precedence over the legacy `thinking` boolean.
+    let reasoningEffort: ReasoningEffort | undefined;
+    if (req.config.reasoning_effort !== undefined) {
+      reasoningEffort = validateReasoningEffort(req.config.reasoning_effort);
+    } else if (req.config.thinking !== undefined) {
+      reasoningEffort = validateReasoningEffort(
+        reasoningEffortFromThinking(
+          req.config.thinking === true || req.config.thinking === "true" ? true :
+          req.config.thinking === false || req.config.thinking === "false" ? false :
+          req.config.thinking
+        )
+      );
+    }
+
+    helpers.session.set("model", model || undefined);
     helpers.session.set("cwd", req.config.cwd || undefined);
-    helpers.session.set("thinking", req.config.thinking === true || req.config.thinking === "true" || undefined);
+    helpers.session.set("reasoningEffort", reasoningEffort || undefined);
     helpers.session.set("claudeExecutable", req.config.claude_executable || undefined);
     helpers.session.set("baseUrl", req.config.base_url || undefined);
     helpers.session.set(
@@ -604,7 +705,7 @@ export const adapterConfig = {
       lastResultText: helpers.session.get<string>("lastResultText") ?? "",
       model: helpers.session.get<string>("model") ?? undefined,
       cwd: helpers.session.get<string>("cwd") ?? undefined,
-      thinking: helpers.session.get<boolean>("thinking") ?? undefined,
+      reasoningEffort: helpers.session.get<ReasoningEffort>("reasoningEffort") ?? undefined,
       systemPromptAppend: helpers.session.get<string>("systemPromptAppend") ?? undefined,
       baseUrl: helpers.session.get<string>("baseUrl") ?? undefined,
       claudeExecutable: helpers.session.get<string>("claudeExecutable") ?? undefined,
@@ -620,7 +721,14 @@ export const adapterConfig = {
     helpers.session.set("lastResultText", (snapshot.lastResultText as string) ?? "");
     helpers.session.set("model", snapshot.model as string | undefined);
     helpers.session.set("cwd", snapshot.cwd as string | undefined);
-    helpers.session.set("thinking", snapshot.thinking as boolean | undefined);
+    // Migrate legacy `thinking` boolean snapshots into the reasoning_effort vocabulary.
+    if (snapshot.reasoningEffort !== undefined) {
+      helpers.session.set("reasoningEffort", snapshot.reasoningEffort as ReasoningEffort | undefined);
+    } else if (snapshot.thinking !== undefined) {
+      helpers.session.set("reasoningEffort", reasoningEffortFromThinking(snapshot.thinking));
+    } else {
+      helpers.session.set("reasoningEffort", undefined);
+    }
     helpers.session.set("systemPromptAppend", snapshot.systemPromptAppend as string | undefined);
     helpers.session.set("baseUrl", snapshot.baseUrl as string | undefined);
     helpers.session.set("claudeExecutable", snapshot.claudeExecutable as string | undefined);
