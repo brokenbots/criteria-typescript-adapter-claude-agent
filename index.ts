@@ -527,11 +527,12 @@ export const adapterConfig = {
   ],
 
   permissions: [
-    { name: "read_file" },
-    { name: "write_file" },
-    { name: "edit_file" },
-    { name: "run_command" },
-    { name: "list_directory" },
+    { name: "Read" },
+    { name: "Bash" },
+    { name: "Write" },
+    { name: "Edit" },
+    { name: "Glob" },
+    { name: "Grep" },
   ],
 
   config_schema: {

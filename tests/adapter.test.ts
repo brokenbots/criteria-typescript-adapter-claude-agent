@@ -521,7 +521,7 @@ describe("claude-agent adapter v2", () => {
             const promises = [];
             for (let i = 0; i < 50; i++) {
               promises.push(
-                canUseTool("read_file", { path: `/tmp/file${i}.txt` }, {
+                canUseTool("Read", { path: `/tmp/file${i}.txt` }, {
                   signal: new AbortController().signal,
                   toolUseID: `tool-${i}`,
                 })
@@ -759,7 +759,7 @@ describe("claude-agent adapter v2", () => {
         async *[Symbol.asyncIterator]() {
           const { canUseTool } = opts.options || {};
           if (canUseTool) {
-            const result = await canUseTool("read_file", { path: "/tmp/readme.md" }, {
+            const result = await canUseTool("Read", { path: "/tmp/readme.md" }, {
               signal: new AbortController().signal,
               toolUseID: "tool-read",
             });
@@ -792,11 +792,123 @@ describe("claude-agent adapter v2", () => {
     });
 
     expect(capturedPayload).toBeDefined();
-    expect(capturedPayload?.tool).toBe("read_file");
+    expect(capturedPayload?.tool).toBe("Read");
     expect(capturedPayload).not.toHaveProperty("full_command_text");
     expect(capturedPayload).not.toHaveProperty("commands");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
+  });
+
+  test("CRI-32: declared permissions match runtime SDK tool names", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const declared = (mod.adapterConfig.permissions ?? []).map((p: any) =>
+      typeof p === "string" ? p : p.name
+    );
+    expect(declared.sort()).toEqual(["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
+    for (const oldName of ["read_file", "write_file", "edit_file", "run_command", "list_directory"]) {
+      expect(declared).not.toContain(oldName);
+    }
+
+    const capturedTools: string[] = [];
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            for (const tool of ["Read", "Bash", "Write", "Edit", "Glob", "Grep"]) {
+              const result = await canUseTool(tool, { path: `/tmp/${tool.toLowerCase()}` }, {
+                signal: new AbortController().signal,
+                toolUseID: `tool-${tool}`,
+              });
+              expect(result.behavior).toBe("allow");
+            }
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "cri32-declared-permissions",
+      input: { prompt: "use all tools" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream, payload) => {
+        const parsed = payload ? fromProtoStruct(payload) : undefined;
+        if (typeof parsed?.tool === "string") capturedTools.push(parsed.tool);
+        permStream.write({ request: { requestId: reqId } });
+      },
+    });
+
+    expect(capturedTools.sort()).toEqual(["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
+    await host.stop();
+  });
+
+  test("CRI-32: allow_tools with a single declared name grants the matching runtime tool", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const declared = (mod.adapterConfig.permissions ?? []).map((p: any) =>
+      typeof p === "string" ? p : p.name
+    );
+
+    for (const allowed of declared) {
+      let requestedTool: string | undefined;
+
+      mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+        query: (opts: any) => ({
+          async *[Symbol.asyncIterator]() {
+            const { canUseTool } = opts.options || {};
+            if (canUseTool) {
+              const result = await canUseTool(allowed, { path: "/tmp/x" }, {
+                signal: new AbortController().signal,
+                toolUseID: `tool-${allowed}`,
+              });
+              expect(result.behavior).toBe("allow");
+            }
+            yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+          },
+          close() {},
+          async interrupt() {},
+        }),
+        createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+      }));
+
+      const host = new TestHost({
+        config: mod.adapterConfig,
+        autoGrantPermissions: false,
+      });
+      await host.start();
+      await host.openSession({ config: { claude_executable: FAKE_CLI } });
+
+      const { outcome } = await executeWithManualPermission(host, {
+        stepName: `cri32-allow-${allowed}`,
+        input: { prompt: `allow ${allowed}` },
+        allowedOutcomes: ["success"],
+        onRequest: (reqId, permStream, payload) => {
+          const parsed = payload ? fromProtoStruct(payload) : undefined;
+          requestedTool = parsed?.tool as string | undefined;
+          if (requestedTool === allowed) {
+            permStream.write({ request: { requestId: reqId } });
+          } else {
+            permStream.write({ cancel: { requestId: reqId, reason: "not in allow_tools" } });
+          }
+        },
+      });
+
+      expect(requestedTool).toBe(allowed);
+      expect(["success", "failure", "needs_review"]).toContain(outcome);
+      await host.stop();
+    }
   });
 
   test("host permission.granted with matching request_id resolves to allow in under 1 second", async () => {
