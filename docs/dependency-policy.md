@@ -28,12 +28,13 @@ compromised) release gets a cooldown window before we ingest it.
 **Security updates bypass the cooldown** — availability of a fix outranks the
 supply-chain wait.
 
-## How freshness & vulnerabilities are tracked — no update bot
+## How freshness & vulnerabilities are tracked — bun tooling, not Dependabot
 
-This repo deliberately runs **no automated dependency-update bot** (no Dependabot
-/ Renovate). The dependency surface is small (the SDK is a local `file:` sibling;
-the only external runtime dep is the model SDK), so freshness is managed by
-review against the tooling below rather than a stream of bot PRs:
+Dependabot is **not** the source of truth for freshness. It is slow, and it
+cannot perform the call-site or peer-dependency work that a npm/bun **major**
+upgrade often requires. Dependabot is demoted to the routine minor/patch lane
+(see below); the freshness picture and major upgrades are driven by bun
+version-pinned in [`package.json`](../package.json) (no floating `@latest`):
 
 | Command | Tool | Answers |
 | --- | --- | --- |
@@ -54,12 +55,24 @@ bun update <pkg> --latest   # move to the latest, incl. major
 
 After any upgrade: `bun install`, `bun run build`, `bun test`, `bun run vuln-scan`.
 
+## The update bot — Dependabot (routine minor/patch lane)
+
+[`.github/dependabot.yml`](../.github/dependabot.yml) is configured to:
+
+- cover this npm/bun package plus the `github-actions` ecosystem;
+- **not** ignore `semver-major` updates (majors it raises are *signals* — drive
+  them with `bun update --latest`);
+- apply a **7-day cooldown** (`cooldown: default-days: 7`); security updates are
+  exempt by Dependabot's design;
+- group minor + patch updates to keep PR volume sane.
+
 ## Holding a dependency below latest
 
 To pin a dependency below its latest version, record it as a dated exception so
 the decision is auditable and re-reviewed — mirroring the `osv-scanner.toml`
-"documented + dated" convention. Add an entry below citing the advisory or bug id
-and a review date; pin the constraint in `package.json`.
+"documented + dated" convention. Add an entry to the table below **and** the
+matching `ignore` constraint in `.github/dependabot.yml`, citing the advisory or
+bug id and a review date; pin the constraint in `package.json`.
 
 | Dependency | Held at | Reason (advisory / bug) | Review by |
 | --- | --- | --- | --- |
