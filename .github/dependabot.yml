@@ -1,0 +1,37 @@
+version: 2
+
+# Dependency-freshness & supply-chain policy: docs/dependency-policy.md
+#
+# Dependabot owns only the routine minor/patch lane. Major upgrades in npm/bun
+# often require call-site or peer-dependency changes, so majors it raises are
+# signals rather than merge-ready PRs; freshness is tracked by `bun outdated`
+# (see `bun run deps:outdated`).
+#
+# Every ecosystem carries a 7-day cooldown so a freshly-published (possibly
+# compromised) release is not ingested immediately. Security updates are exempt
+# from the cooldown by Dependabot's design. Majors are no longer ignored.
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
