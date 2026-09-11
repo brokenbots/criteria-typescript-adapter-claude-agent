@@ -129,9 +129,9 @@ function validateModel(value: unknown): string | undefined {
   if (trimmed === "") {
     throw new Error("Invalid model: must be a non-empty string.");
   }
-  if (!/^[a-zA-Z0-9_.\-]+$/.test(trimmed)) {
+  if (!/^[a-zA-Z0-9_.\-/:]+$/.test(trimmed)) {
     throw new Error(
-      `Invalid model ${JSON.stringify(trimmed)}: must contain only letters, numbers, hyphens, underscores, and dots.`
+      `Invalid model ${JSON.stringify(trimmed)}: must contain only letters, numbers, hyphens, underscores, dots, slashes, and colons.`
     );
   }
   return trimmed;
@@ -139,12 +139,23 @@ function validateModel(value: unknown): string | undefined {
 
 /**
  * Convert a legacy `thinking` boolean into the reasoning_effort vocabulary.
- * `true` maps to "high" (matching the previous adaptive-thinking default),
- * `false` maps to "none". Returns undefined when the value is not a boolean.
+ * `true` maps to "high" (generalizes the previous adaptive-thinking behavior
+ * into the high-effort budget tier), `false` maps to "none". Returns undefined
+ * when the value is not a boolean.
  */
 function reasoningEffortFromThinking(value: unknown): ReasoningEffort | undefined {
   if (value === true) return "high";
   if (value === false) return "none";
+  return undefined;
+}
+
+/**
+ * Coerce the legacy `thinking` config value, which may be a boolean or the
+ * strings "true"/"false", into a boolean. Returns undefined for other values.
+ */
+function coerceLegacyThinking(value: unknown): boolean | undefined {
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
   return undefined;
 }
 
@@ -670,14 +681,11 @@ export const adapterConfig = {
     let reasoningEffort: ReasoningEffort | undefined;
     if (req.config.reasoning_effort !== undefined) {
       reasoningEffort = validateReasoningEffort(req.config.reasoning_effort);
-    } else if (req.config.thinking !== undefined) {
-      reasoningEffort = validateReasoningEffort(
-        reasoningEffortFromThinking(
-          req.config.thinking === true || req.config.thinking === "true" ? true :
-          req.config.thinking === false || req.config.thinking === "false" ? false :
-          req.config.thinking
-        )
-      );
+    } else {
+      const legacyThinking = coerceLegacyThinking(req.config.thinking);
+      if (legacyThinking !== undefined) {
+        reasoningEffort = validateReasoningEffort(reasoningEffortFromThinking(legacyThinking));
+      }
     }
 
     helpers.session.set("model", model || undefined);

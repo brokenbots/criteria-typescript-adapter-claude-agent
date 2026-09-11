@@ -1257,6 +1257,40 @@ describe("claude-agent adapter v2", () => {
     await host.stop();
   });
 
+  test("OpenSession accepts documented Ollama model names with colons and slashes", async () => {
+    const capturedModels: string[] = [];
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedModels.push(opts.options?.model);
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    // AGENTS.md documents Ollama mode with model identifiers such as "kimi-k2.7-code:cloud".
+    await host.openSession({ config: { model: "kimi-k2.7-code:cloud", claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "ollama-model", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+
+    // Per-step overrides must also accept the colon/slash form.
+    await host.execute({
+      stepName: "ollama-override",
+      input: { prompt: "test", model: "library/kimi-k2.7-code:cloud" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedModels).toEqual(["kimi-k2.7-code:cloud", "library/kimi-k2.7-code:cloud"]);
+    await host.stop();
+  });
+
   test("per-step model override takes precedence over config model", async () => {
     const capturedModels: string[] = [];
 
