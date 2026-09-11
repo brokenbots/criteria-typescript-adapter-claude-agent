@@ -1171,4 +1171,266 @@ describe("claude-agent adapter v2", () => {
     expect(outputs.reason).toBe("Task completed successfully.");
     await host.stop();
   });
+
+  test("OpenSession accepts valid reasoning_effort values", async () => {
+    const capturedThinking: Record<string, any> = {};
+    const makeQuery = (effort: string) => (opts: any) => ({
+      async *[Symbol.asyncIterator]() {
+        capturedThinking[effort] = opts.options?.thinking;
+        yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+      },
+      close() {},
+      async interrupt() {},
+    });
+
+    for (const effort of ["none", "low", "medium", "high"]) {
+      mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+        query: makeQuery(effort),
+        createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+      }));
+
+      const mod = await import(`${adapterPath}?${Date.now()}`);
+      const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+      await host.start();
+      await host.openSession({ config: { reasoning_effort: effort, claude_executable: FAKE_CLI } });
+      await host.execute({ stepName: `effort-${effort}`, input: { prompt: "test" }, allowedOutcomes: ["success"] });
+      await host.stop();
+    }
+
+    expect(capturedThinking["none"]).toEqual({ type: "disabled" });
+    expect(capturedThinking["low"]).toEqual({ type: "enabled", budgetTokens: 4096 });
+    expect(capturedThinking["medium"]).toEqual({ type: "enabled", budgetTokens: 16384 });
+    expect(capturedThinking["high"]).toEqual({ type: "enabled", budgetTokens: 65536 });
+  });
+
+  test("OpenSession rejects invalid reasoning_effort", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await expect(
+      host.openSession({ config: { reasoning_effort: "xhigh", claude_executable: FAKE_CLI } })
+    ).rejects.toThrow(/Invalid reasoning_effort/);
+
+    await host.stop();
+  });
+
+  test("OpenSession rejects invalid model values", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await expect(
+      host.openSession({ config: { model: "   ", claude_executable: FAKE_CLI } })
+    ).rejects.toThrow(/Invalid model/);
+
+    await expect(
+      host.openSession({ config: { model: "claude sonnet", claude_executable: FAKE_CLI } })
+    ).rejects.toThrow(/Invalid model/);
+
+    await host.stop();
+  });
+
+  test("OpenSession trims and accepts valid model", async () => {
+    let capturedModel: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedModel = opts.options?.model;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { model: "  claude-sonnet-4-6  ", claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "model-trim", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+
+    expect(capturedModel).toBe("claude-sonnet-4-6");
+    await host.stop();
+  });
+
+  test("OpenSession accepts documented Ollama model names with colons and slashes", async () => {
+    const capturedModels: string[] = [];
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedModels.push(opts.options?.model);
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    // AGENTS.md documents Ollama mode with model identifiers such as "kimi-k2.7-code:cloud".
+    await host.openSession({ config: { model: "kimi-k2.7-code:cloud", claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "ollama-model", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+
+    // Per-step overrides must also accept the colon/slash form.
+    await host.execute({
+      stepName: "ollama-override",
+      input: { prompt: "test", model: "library/kimi-k2.7-code:cloud" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedModels).toEqual(["kimi-k2.7-code:cloud", "library/kimi-k2.7-code:cloud"]);
+    await host.stop();
+  });
+
+  test("per-step model override takes precedence over config model", async () => {
+    const capturedModels: string[] = [];
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedModels.push(opts.options?.model);
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { model: "config-model", claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "config-model-step", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+    await host.execute({
+      stepName: "step-override",
+      input: { prompt: "test", model: "step-model" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(capturedModels).toEqual(["config-model", "step-model"]);
+    await host.stop();
+  });
+
+  test("legacy thinking true maps to reasoning_effort high", async () => {
+    let capturedThinking: any;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedThinking = opts.options?.thinking;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { thinking: true, claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "legacy-thinking", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+
+    expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 65536 });
+    await host.stop();
+  });
+
+  test("legacy thinking false maps to reasoning_effort none", async () => {
+    let capturedThinking: any;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedThinking = opts.options?.thinking;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { thinking: false, claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "legacy-thinking-false", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+
+    expect(capturedThinking).toEqual({ type: "disabled" });
+    await host.stop();
+  });
+
+  test("reasoning_effort takes precedence over legacy thinking", async () => {
+    let capturedThinking: any;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedThinking = opts.options?.thinking;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { reasoning_effort: "low", thinking: true, claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "effort-wins", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+
+    expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 4096 });
+    await host.stop();
+  });
+
+  test("snapshot and restore preserve reasoning_effort", async () => {
+    let capturedThinking: any;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedThinking = opts.options?.thinking;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { reasoning_effort: "medium", claude_executable: FAKE_CLI } });
+    await host.execute({ stepName: "before-snap", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+    expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 16384 });
+
+    const snap = await host.snapshot();
+    await host.closeSession();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    await host.restore(snap);
+    await host.execute({ stepName: "after-restore", input: { prompt: "test" }, allowedOutcomes: ["success"] });
+    expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 16384 });
+
+    await host.stop();
+  });
 });
