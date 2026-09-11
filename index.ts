@@ -251,7 +251,19 @@ function buildCanUseTool(helpers: Helpers) {
       toolUseID: string;
     }
   ): Promise<PermissionResult> => {
-    const decision = await helpers.permission.request({ tool: toolName, args: input });
+    const payload: Record<string, unknown> = { tool: toolName, args: input };
+    if (input && typeof input === "object") {
+      if (typeof (input as any).command === "string" && (input as any).command.length > 0) {
+        payload.full_command_text = (input as any).command;
+      }
+      if ("commands" in (input as any)) {
+        const cmds = (input as any).commands;
+        if (typeof cmds === "string" || (Array.isArray(cmds) && cmds.every((c: unknown) => typeof c === "string"))) {
+          payload.commands = cmds;
+        }
+      }
+    }
+    const decision = await helpers.permission.request(payload);
     if (decision.decision === "allow") {
       return { behavior: "allow", toolUseID: options.toolUseID };
     }

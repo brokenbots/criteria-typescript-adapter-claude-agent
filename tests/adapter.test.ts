@@ -1,5 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
 import { TestHost } from "@criteria/adapter-sdk/testing";
+// Avoid package-name resolution games for the deep import by using a file URL.
+import { fromProtoStruct } from "../node_modules/@criteria/adapter-sdk/dist/plugin/server-v2.js";
 
 // Mock the claude-agent-sdk so we don't need the real CLI binary
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
@@ -604,6 +606,195 @@ describe("claude-agent adapter v2", () => {
     expect(capturedSnake).toBeDefined();
     expect(capturedSnake?.length).toBeGreaterThan(0);
     expect(capturedCamel).toBe(capturedSnake);
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
+    await host.stop();
+  });
+
+  test("CRI-31: permission.request payload forwards full_command_text for Bash command", async () => {
+    const commandText = "echo matched > /tmp/cri31-proof/PROOF.txt";
+    let capturedPayload: Record<string, any> | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            const result = await canUseTool("Bash", { command: commandText }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-cri31",
+            });
+            expect(result.behavior).toBe("allow");
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "cri31-fingerprint",
+      input: { prompt: "run command" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream, payload) => {
+        capturedPayload = payload ? fromProtoStruct(payload) : undefined;
+        permStream.write({ request: { requestId: reqId } });
+      },
+    });
+
+    expect(capturedPayload).toBeDefined();
+    expect(capturedPayload?.tool).toBe("Bash");
+    expect(capturedPayload?.full_command_text).toBe(commandText);
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
+    await host.stop();
+  });
+
+  test("CRI-31: bare allow_tools = [\"Bash\"] still grants without fingerprint", async () => {
+    let capturedBehavior: string | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            const result = await canUseTool("Bash", { command: "echo hello" }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-bare",
+            });
+            capturedBehavior = result.behavior;
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "cri31-bare-allow",
+      input: { prompt: "run command" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream) => {
+        // Grant without inspecting the payload, mirroring bare-tool-name policy.
+        permStream.write({ request: { requestId: reqId } });
+      },
+    });
+
+    expect(capturedBehavior).toBe("allow");
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
+    await host.stop();
+  });
+
+  test("CRI-31: commands array is forwarded as a command fingerprint", async () => {
+    const commands = ["echo one", "echo two"];
+    let capturedPayload: Record<string, any> | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            const result = await canUseTool("Bash", { commands }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-commands",
+            });
+            expect(result.behavior).toBe("allow");
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "cri31-commands",
+      input: { prompt: "run commands" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream, payload) => {
+        capturedPayload = payload ? fromProtoStruct(payload) : undefined;
+        permStream.write({ request: { requestId: reqId } });
+      },
+    });
+
+    expect(capturedPayload).toBeDefined();
+    expect(capturedPayload?.tool).toBe("Bash");
+    expect(capturedPayload?.commands).toEqual(commands);
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
+    await host.stop();
+  });
+
+  test("CRI-31: non-command tools omit full_command_text and commands", async () => {
+    let capturedPayload: Record<string, any> | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            const result = await canUseTool("read_file", { path: "/tmp/readme.md" }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-read",
+            });
+            expect(result.behavior).toBe("allow");
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: false,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome } = await executeWithManualPermission(host, {
+      stepName: "cri31-non-command",
+      input: { prompt: "read file" },
+      allowedOutcomes: ["success"],
+      onRequest: (reqId, permStream, payload) => {
+        capturedPayload = payload ? fromProtoStruct(payload) : undefined;
+        permStream.write({ request: { requestId: reqId } });
+      },
+    });
+
+    expect(capturedPayload).toBeDefined();
+    expect(capturedPayload?.tool).toBe("read_file");
+    expect(capturedPayload).not.toHaveProperty("full_command_text");
+    expect(capturedPayload).not.toHaveProperty("commands");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
   });
