@@ -11,6 +11,17 @@ import {
   sanitizeReason,
 } from "../outcome.js";
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { TestHost } from "@criteria/adapter-sdk/testing";
+import {
+  adapterPath,
+  FAKE_CLI,
+  executeWithOutputs,
+  MockMcpServer,
+  MockQueryWithOutcome,
+  MockQueryWithOutcomeAndSession,
+  MockQueryHangs,
+  MockQueryNoOutcome,
+} from "./helpers.js";
 
 class MockMcpServer {
   name: string;
@@ -305,5 +316,304 @@ describe("outcome module", () => {
     expect(resolved.outcome).toBe("failure");
     expect(resolved.reason).toContain("Agent query failed");
     expect(resolved.reason).toContain("the agent crashed");
+  });
+});
+
+describe("outcome integration", () => {
+  test("declared output_schema keys match emitted outputs when agent submits outcome", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", "Task completed successfully."),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "submit-outcome-outputs",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(outcome).toBe("success");
+    expect(Object.keys(outputs).sort()).toEqual(Object.keys(mod.adapterConfig.output_schema.fields).sort());
+    expect(outputs.reason).toBe("Task completed successfully.");
+    await host.stop();
+  });
+
+  test("declared output_schema keys match emitted outputs on fallback path", async () => {
+    // The default MockQuery never calls submit_outcome, so the adapter takes
+    // the fallback path after re-prompting.
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool, allowedTools } = opts.options || {};
+          if (canUseTool && allowedTools) {
+            for (const tool of allowedTools) {
+              const parts = tool.split("__");
+              const toolName = parts[parts.length - 1];
+              if (toolName === "submit_outcome") continue;
+              await canUseTool(toolName, {}, {
+                signal: new AbortController().signal,
+                toolUseID: `tool-${toolName}`,
+              });
+            }
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 100, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "fallback-outputs",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(["failure", "needs_review"]).toContain(outcome);
+    expect(Object.keys(outputs).sort()).toEqual(Object.keys(mod.adapterConfig.output_schema.fields).sort());
+    expect(outputs.reason).toContain("Agent completed without submitting a valid outcome");
+    expect(outputs.reason).toContain("missing finalize");
+    // No session_id is produced by the default MockQuery, so no reprompt turns occur.
+    expect(outputs.reason).toContain("after 1 finalize attempt");
+    await host.stop();
+  });
+
+  test("declared output_schema types match emitted types", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", "Typed reason value"),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const { outputs } = await executeWithOutputs(host, {
+      stepName: "type-check-outputs",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    const declaredType = mod.adapterConfig.output_schema.fields.reason?.type;
+    expect(declaredType).toBe("string");
+    expect(typeof outputs.reason).toBe("string");
+    await host.stop();
+  });
+
+  test("adapter does not declare outcome as a step output", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    expect(mod.adapterConfig.output_schema.fields).not.toHaveProperty("outcome");
+  });
+
+  test("reason output is declared and not marked sensitive", async () => {
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const reasonField = mod.adapterConfig.output_schema.fields.reason;
+    expect(reasonField).toBeDefined();
+    expect(reasonField.type).toBe("string");
+    expect(reasonField.sensitive).toBeFalsy();
+  });
+
+  test("held secret echoed into reason is redacted to a placeholder", async () => {
+    const secretApiKey = "sk-ant-api03-held-secret-12345";
+    const secretAuthToken = "sk-ant-auth03-held-secret-67890";
+    const rawReason = `I used key ${secretApiKey} and token ${secretAuthToken} during my work.`;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", rawReason),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({
+      config: { claude_executable: FAKE_CLI },
+      secrets: {
+        ANTHROPIC_API_KEY: secretApiKey,
+        ANTHROPIC_AUTH_TOKEN: secretAuthToken,
+      },
+    });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "redact-secrets",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(outcome).toBe("success");
+    expect(outputs.reason).not.toContain(secretApiKey);
+    expect(outputs.reason).not.toContain(secretAuthToken);
+    expect(outputs.reason).toContain("[REDACTED]");
+    expect(outputs.reason).toBe(
+      "I used key [REDACTED] and token [REDACTED] during my work."
+    );
+    await host.stop();
+  });
+
+  test("reason is passed through unchanged when it contains no held secret", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcome(opts, "success", "Task completed successfully."),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({
+      config: mod.adapterConfig,
+      autoGrantPermissions: true,
+    });
+    await host.start();
+
+    await host.openSession({
+      config: { claude_executable: FAKE_CLI },
+      secrets: {
+        ANTHROPIC_API_KEY: "a-different-secret-value",
+      },
+    });
+    const { outcome, outputs } = await executeWithOutputs(host, {
+      stepName: "passthrough-reason",
+      input: { prompt: "Do the thing" },
+      allowedOutcomes: ["success", "failure"],
+    });
+
+    expect(outcome).toBe("success");
+    expect(outputs.reason).toBe("Task completed successfully.");
+    await host.stop();
+  });
+
+  test("invalid submitted outcome is rejected and falls back to failure after max attempts", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcomeAndSession(opts, "not_allowed", "I picked this"),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "invalid-outcome",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toContain("invalid outcome");
+    expect(result.reason).toContain("after 3 finalize attempt(s)");
+    await host.stop();
+  });
+
+  test("timeout emits failure outcome when step exceeds timeout_ms", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryHangs(opts),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "timeout",
+      input: { prompt: "test", timeout_ms: 50 },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toMatch(/timed out|timeout/i);
+    await host.stop();
+  });
+
+  test("timeout returns needs_review when it is an allowed outcome", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryHangs(opts),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "timeout-review",
+      input: { prompt: "test", timeout_ms: 50 },
+      allowedOutcomes: ["success", "needs_review"],
+    });
+
+    expect(result.outcome).toBe("needs_review");
+    expect(result.reason).toMatch(/timed out|timeout/i);
+    await host.stop();
+  });
+
+  test("max attempts exhausted emits fallback failure outcome", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryNoOutcome(opts),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "no-outcome",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toContain("missing finalize");
+    expect(result.reason).toContain("after 3 finalize attempt(s)");
+    await host.stop();
+  });
+
+  test("no declared allowed outcomes disables finalization via submit_outcome", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcomeAndSession(opts, "success", "No outcomes"),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "no-outcomes",
+      input: { prompt: "test" },
+      allowedOutcomes: [],
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toContain("step has no declared outcomes");
+    expect(result.reason).toContain("after 1 finalize attempt");
+    await host.stop();
   });
 });
