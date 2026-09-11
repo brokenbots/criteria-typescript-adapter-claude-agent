@@ -86,6 +86,86 @@ class MockQueryWithOutcome implements AsyncIterable<any> {
 }
 
 /**
+ * Like MockQueryWithOutcome but also reports a session_id so the adapter's
+ * resume/reprompt loop runs to completion.
+ */
+class MockQueryWithOutcomeAndSession extends MockQueryWithOutcome {
+  async *[Symbol.asyncIterator]() {
+    const self = this as any;
+    const { mcpServers, allowedTools } = self.opts.options || {};
+    if (mcpServers && allowedTools) {
+      for (const toolRef of allowedTools) {
+        const parts = toolRef.split("__");
+        const toolName = parts[parts.length - 1];
+        if (toolName !== "submit_outcome") continue;
+
+        const serverName = Object.keys(mcpServers)[0];
+        const server = mcpServers[serverName];
+        const tool = server?.tools?.find((t: any) => t.name === "submit_outcome");
+        if (tool?.handler) {
+          await tool.handler({ outcome: self.outcome, reason: self.reason });
+        }
+      }
+    }
+    yield {
+      type: "result",
+      subtype: "success",
+      result: "done",
+      duration_ms: 100,
+      num_turns: 1,
+      total_cost_usd: 0,
+      session_id: "mock-session",
+    };
+  }
+}
+
+/**
+ * Simulates an agent query that never yields and respects the abort signal,
+ * so a short step timeout can be exercised.
+ */
+class MockQueryHangs implements AsyncIterable<any> {
+  private opts: any;
+  constructor(opts: any) {
+    this.opts = opts;
+  }
+
+  async *[Symbol.asyncIterator]() {
+    const abortController = this.opts.options?.abortController as AbortController | undefined;
+    await new Promise<void>((_, reject) => {
+      if (abortController?.signal.aborted) {
+        reject(new Error("Aborted"));
+        return;
+      }
+      abortController?.signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
+    });
+  }
+
+  close() {}
+  async interrupt() {}
+}
+
+/**
+ * Simulates an agent run that returns a result but never calls submit_outcome.
+ * Reports a session_id so the adapter will exhaust its reprompt attempts.
+ */
+class MockQueryNoOutcome implements AsyncIterable<any> {
+  async *[Symbol.asyncIterator]() {
+    yield {
+      type: "result",
+      subtype: "success",
+      result: "done",
+      duration_ms: 100,
+      num_turns: 1,
+      total_cost_usd: 0,
+      session_id: "mock-session",
+    };
+  }
+
+  close() {}
+  async interrupt() {}
+}
+
+/**
  * Execute a step through a TestHost and return the full outputs map exposed by
  * the wire result event. TestHost only exposes `reason` on its friendly return
  * value, so we talk to the underlying gRPC client to capture the exact key set.
@@ -1059,7 +1139,10 @@ describe("claude-agent adapter v2", () => {
 
     expect(["failure", "needs_review"]).toContain(outcome);
     expect(Object.keys(outputs).sort()).toEqual(Object.keys(mod.adapterConfig.output_schema.fields).sort());
-    expect(outputs.reason).toContain("Agent completed without submitting an outcome");
+    expect(outputs.reason).toContain("Agent completed without submitting a valid outcome");
+    expect(outputs.reason).toContain("missing finalize");
+    // No session_id is produced by the default MockQuery, so no reprompt turns occur.
+    expect(outputs.reason).toContain("after 1 finalize attempt");
     await host.stop();
   });
 
@@ -1431,6 +1514,74 @@ describe("claude-agent adapter v2", () => {
     await host.execute({ stepName: "after-restore", input: { prompt: "test" }, allowedOutcomes: ["success"] });
     expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 16384 });
 
+    await host.stop();
+  });
+
+  test("invalid submitted outcome is rejected and falls back to failure after max attempts", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryWithOutcomeAndSession(opts, "not_allowed", "I picked this"),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "invalid-outcome",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toContain("invalid outcome");
+    expect(result.reason).toContain("after 3 finalize attempt(s)");
+    await host.stop();
+  });
+
+  test("timeout emits failure outcome when step exceeds timeout_ms", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryHangs(opts),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "timeout",
+      input: { prompt: "test", timeout_ms: 50 },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toMatch(/timed out|timeout/i);
+    await host.stop();
+  });
+
+  test("max attempts exhausted emits fallback failure outcome", async () => {
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => new MockQueryNoOutcome(opts),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+    await host.start();
+
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    const result = await host.execute({
+      stepName: "no-outcome",
+      input: { prompt: "test" },
+      allowedOutcomes: ["success"],
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toContain("missing finalize");
+    expect(result.reason).toContain("after 3 finalize attempt(s)");
     await host.stop();
   });
 });
