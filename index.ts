@@ -13,16 +13,24 @@
  * - Structured events for observability
  *
  * Secrets:
- * - ANTHROPIC_API_KEY    – Optional. If unset, the Claude Code CLI falls back
+ * - ANTHROPIC_API_KEY     – Optional. If unset, the Claude Code CLI falls back
  *   to its own stored credentials (e.g. `claude` login / OAuth).
- * - ANTHROPIC_AUTH_TOKEN – Optional. Auth token.
+ * - ANTHROPIC_AUTH_TOKEN  – Optional. Auth token.
+ * - CRITERIA_REMOTE_TOKEN – Optional. Bearer token presented to the remote host
+ *   shim during the identity handshake. Only used in remote mode.
  *
  * Config:
- * - base_url             – Optional. Overrides the Anthropic API base URL.
+ * - base_url              – Optional. Overrides the Anthropic API base URL.
  *   Falls back to the ANTHROPIC_BASE_URL environment variable.
+ *
+ * Remote mode:
+ * - CRITERIA_REMOTE_HOST  – Optional. When set, the adapter dials this host:port
+ *   and runs via `serveRemote()` instead of local `serve()`.
+ * - CRITERIA_REMOTE_DIGEST – Required in remote mode. The adapter artifact digest
+ *   sent in the identity handshake and verified by the host.
  */
 
-import { serve } from "@criteria/adapter-sdk";
+import { serve, serveRemote } from "@criteria/adapter-sdk";
 import { query, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { Query, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
@@ -619,9 +627,42 @@ export const adapterConfig = {
   },
 };
 
+/**
+ * Entry-point dispatcher. Detects remote mode from the environment and calls
+ * either `serveRemote()` (when CRITERIA_REMOTE_HOST is set) or the local
+ * `serve()` path. Exported so tests can exercise mode selection without
+ * spawning a real process.
+ */
+export async function main(): Promise<void> {
+  const remoteHost = process.env.CRITERIA_REMOTE_HOST;
+  if (remoteHost) {
+    const digest = process.env.CRITERIA_REMOTE_DIGEST;
+    if (!digest) {
+      throw new Error(
+        "CRITERIA_REMOTE_DIGEST is required when running in remote mode (CRITERIA_REMOTE_HOST is set)"
+      );
+    }
+
+    await serveRemote(adapterConfig, {
+      host: remoteHost,
+      ...(process.env.CRITERIA_REMOTE_TOKEN
+        ? { accept_token: process.env.CRITERIA_REMOTE_TOKEN }
+        : {}),
+      identity: {
+        name: PLUGIN_NAME,
+        version: PLUGIN_VERSION,
+        digest,
+      },
+    });
+    return;
+  }
+
+  serve(adapterConfig);
+}
+
 // Only start the server when this file is the main entry point
 if (import.meta.url === `file://${process.argv[1]}`) {
-  serve(adapterConfig);
+  main();
 }
 
 export default adapterConfig;
