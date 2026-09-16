@@ -9,6 +9,8 @@
  * - Spawns real Claude Code CLI subprocess
  * - Bridges permission requests to Criteria's permission system via helpers.permission
  * - Custom MCP tool `submit_outcome` for workflow integration
+ * - Custom MCP tool `adapter_tool` so the agent can invoke tools exposed by
+ *   other adapters in the workflow mid-conversation (CRI-180)
  * - Session persistence across execute calls
  * - Structured events for observability
  *
@@ -30,7 +32,7 @@
  *   sent in the identity handshake and verified by the host.
  */
 
-import { serve, serveRemote } from "@criteria/adapter-sdk";
+import { serve, serveRemote, CAPABILITY_ADAPTER_TOOLS } from "@criteria/adapter-sdk";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Query, PermissionResult, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import * as fs from "node:fs";
@@ -38,6 +40,7 @@ import * as path from "node:path";
 import type { Helpers, ExecuteRequest } from "@criteria/adapter-sdk";
 import {
   SUBMIT_OUTCOME_TOOL_NAME,
+  ADAPTER_TOOL_TOOL_NAME,
   MAX_FINALIZE_ATTEMPTS,
   REDACTED_PLACEHOLDER,
   createOutcomeState,
@@ -45,7 +48,6 @@ import {
   buildOutcomeInstructions,
   buildRepromptPrompt,
   resolveOutcome,
-  sanitizeReason,
 } from "./outcome.js";
 
 // ============================================================================
@@ -269,19 +271,12 @@ function buildCanUseTool(helpers: Helpers) {
       toolUseID: string;
     }
   ): Promise<PermissionResult> => {
-    const payload: Record<string, unknown> = { tool: toolName, args: input };
-    if (input && typeof input === "object") {
-      if (typeof (input as any).command === "string" && (input as any).command.length > 0) {
-        payload.full_command_text = (input as any).command;
-      }
-      if ("commands" in (input as any)) {
-        const cmds = (input as any).commands;
-        if (typeof cmds === "string" || (Array.isArray(cmds) && cmds.every((c: unknown) => typeof c === "string"))) {
-          payload.commands = cmds;
-        }
-      }
-    }
-    const decision = await helpers.permission.request(payload);
+    // CRI-179 SDK contract: the host fingerprints args itself via the
+    // canonical-JSON args digest, so only tool + args travel on the wire.
+    const decision = await helpers.permission.request({
+      tool: toolName,
+      args: input,
+    });
     if (decision.decision === "allow") {
       return { behavior: "allow", toolUseID: options.toolUseID };
     }
@@ -462,7 +457,10 @@ async function executeStep(
     systemPrompt: { type: "preset" as const, preset: "claude_code" as const, append: systemPromptAppend },
     cwd,
     canUseTool: buildCanUseTool(helpers),
-    allowedTools: [`mcp__${mcpServer.name}__${SUBMIT_OUTCOME_TOOL_NAME}`],
+    allowedTools: [
+      `mcp__${mcpServer.name}__${SUBMIT_OUTCOME_TOOL_NAME}`,
+      `mcp__${mcpServer.name}__${ADAPTER_TOOL_TOOL_NAME}`,
+    ],
     tools: { type: "preset" as const, preset: "claude_code" as const },
     mcpServers: { [mcpServer.name]: mcpServer },
     // Must stay on for the first execute too, otherwise nothing is written to
@@ -553,7 +551,7 @@ export const adapterConfig = {
   description: "Claude Code agent adapter for Criteria workflows.",
 
   source_url: "https://github.com/brokenbots/criteria-typescript-adapter-claude-agent",
-  capabilities: ["multi_turn", "tool_calling", "structured_events"],
+  capabilities: ["multi_turn", "tool_calling", "structured_events", CAPABILITY_ADAPTER_TOOLS],
   platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
 
   secrets: [

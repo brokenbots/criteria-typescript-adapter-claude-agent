@@ -2,6 +2,8 @@ import { TestHost } from "@criteria/adapter-sdk/testing";
 import { fromProtoStruct } from "../node_modules/@criteria/adapter-sdk/dist/plugin/server-v2.js";
 import { mock } from "bun:test";
 
+import { ADAPTER_TOOL_TOOL_NAME } from "../outcome.js";
+
 export const adapterPath = new URL("../index.ts", import.meta.url).href;
 
 // The adapter resolves the Claude Code CLI up front and refuses to run without
@@ -41,7 +43,9 @@ export class MockQuery implements AsyncIterable<any> {
       for (const tool of allowedTools) {
         const parts = tool.split("__");
         const toolName = parts[parts.length - 1];
-        if (toolName === "submit_outcome") continue;
+        // MCP tools are invoked deliberately by the agent via the MCP server,
+        // not through the canUseTool permission bridge.
+        if (toolName === "submit_outcome" || toolName === ADAPTER_TOOL_TOOL_NAME) continue;
         const result = await canUseTool(toolName, {}, {
           signal: new AbortController().signal,
           toolUseID: `tool-${toolName}`,
@@ -250,8 +254,8 @@ export async function executeWithOutputs(
         const payload = parsePermissionPayload(adapterEvt.payload as any);
         if (kind === "permission.request") {
           const reqId =
-            (payload?.request_id as string | undefined) ??
-            (payload?.requestId as string | undefined);
+            (payload?.requestId as string | undefined) ??
+            (payload?.request_id as string | undefined);
           if (reqId && autoGrant) {
             if (delayMs > 0) {
               setTimeout(() => permStream.write({ request: { requestId: reqId } }), delayMs);
@@ -289,8 +293,8 @@ export async function executeWithOutputs(
 
 /**
  * Execute a step through a TestHost without auto-granting permissions. The
- * caller receives the snake_case request_id from each permission.request event
- * and the Permissions stream so it can manually grant or deny.
+ * caller receives the requestId from each permission.request event and the
+ * Permissions stream so it can manually grant or deny.
  */
 export async function executeWithManualPermission(
   host: TestHost,
@@ -327,7 +331,11 @@ export async function executeWithManualPermission(
       const adapterEvt = evt.adapter as Record<string, unknown> | undefined;
       if (adapterEvt?.eventKind === "permission.request") {
         const payload = adapterEvt.payload as Record<string, any> | undefined;
-        const reqId = payload?.fields?.request_id?.stringValue as string | undefined;
+        // CRI-179 SDK contract: the wire payload carries camelCase requestId.
+        // Keep a snake_case fallback for hosts/SDKs that still emit it.
+        const reqId =
+          payload?.fields?.requestId?.stringValue ??
+          payload?.fields?.request_id?.stringValue;
         if (reqId) opts.onRequest(reqId, permStream, payload);
       }
     });
