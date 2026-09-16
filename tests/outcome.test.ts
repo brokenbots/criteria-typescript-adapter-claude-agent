@@ -1,6 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
 import {
   SUBMIT_OUTCOME_TOOL_NAME,
+  ADAPTER_TOOL_TOOL_NAME,
   MAX_FINALIZE_ATTEMPTS,
   REDACTED_PLACEHOLDER,
   createOutcomeState,
@@ -110,9 +111,13 @@ describe("outcome module", () => {
     }) as MockMcpServer;
 
     expect(server.name).toBe("criteria-workflow");
-    expect(server.tools.length).toBe(1);
+    expect(server.tools.length).toBe(2);
     expect(server.tools[0].name).toBe(SUBMIT_OUTCOME_TOOL_NAME);
     expect(server.tools[0].inputSchema.outcome).toBeDefined();
+    // CRI-180: the caller-side adapter_tool sits on the same SDK MCP server.
+    expect(server.tools[1].name).toBe(ADAPTER_TOOL_TOOL_NAME);
+    expect(server.tools[1].inputSchema.target).toBeDefined();
+    expect(server.tools[1].inputSchema.args).toBeDefined();
   });
 
   test("submit_outcome records a valid outcome", async () => {

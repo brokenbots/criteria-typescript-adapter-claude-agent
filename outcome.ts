@@ -12,9 +12,28 @@
 
 import { z } from "zod";
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import {
+  CALL_ERROR_HOST_UNSUPPORTED,
+  CALL_ERROR_UNKNOWN_ADAPTER,
+  CALL_ERROR_UNKNOWN_TOOL,
+  ToolCallDeniedError,
+  ToolCallError,
+  ToolCallStreamClosedError,
+  ToolCallTimeoutError,
+} from "@criteria/adapter-sdk";
 import type { Helpers } from "@criteria/adapter-sdk";
 
 export const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
+
+/** Name of the caller-side tool the agent invokes to call another adapter's tool (CRI-180). */
+export const ADAPTER_TOOL_TOOL_NAME = "adapter_tool";
+
+export const ADAPTER_TOOL_DESCRIPTION =
+  "Call a tool that is exposed by another adapter in this workflow, e.g. adapter.greet.hello.tools.greet. " +
+  "Only targets granted to this step's tools are callable. " +
+  "A failed call does not fail the step: it returns a typed error as this tool's result (isError), which you should " +
+  'incorporate into your answer — give up after "host_unsupported", report the denial and continue after a denied call, ' +
+  'and correct the target after "unknown_tool".';
 
 /**
  * Placeholder used when a secret value the adapter holds appears in the
@@ -145,6 +164,70 @@ function submitOutcomeSuccess(outcome: string, reason: string, heldSecrets: (str
   };
 }
 
+/** MCP tool-result content for a failed adapter tool call, so the agent sees it as a tool result, not a step failure. */
+function adapterToolError(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
+/**
+ * Map a successful adapter tool call into MCP content: the callee's typed
+ * outputs JSON-encoded as the text content, passed through structured as well
+ * when the callee emitted any.
+ */
+function adapterToolSuccess(
+  outcome: string,
+  outputs: Record<string, unknown> | undefined
+) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(outputs ?? {}) }],
+    ...(outputs !== undefined ? { structuredContent: outputs } : {}),
+    metadata: { outcome },
+  };
+}
+
+/**
+ * Translate a typed adapter tool-call failure (CRI-179 SDK surface) into
+ * agent-facing text. The error class/code must be distinguishable so the
+ * agent can react appropriately: give up on `host_unsupported`, report and
+ * continue on a denial, and correct the target on unknown-tool.
+ */
+function describeAdapterToolFailure(err: unknown): { text: string; code?: string } {
+  if (err instanceof ToolCallDeniedError) {
+    return {
+      code: "deny",
+      text: `Adapter tool call denied by host policy${err.reason ? `: ${err.reason}` : ""}. ` +
+        "Report the denial in your answer and continue with your task.",
+    };
+  }
+  if (err instanceof ToolCallError) {
+    if (err.code === CALL_ERROR_HOST_UNSUPPORTED) {
+      return {
+        code: err.code,
+        text: `Adapter tool call failed: host_unsupported (ToolCallError). ` +
+          "This Criteria host does not support adapter tool calls, so give up on calling adapter tools.",
+      };
+    }
+    if (err.code === CALL_ERROR_UNKNOWN_TOOL || err.code === CALL_ERROR_UNKNOWN_ADAPTER) {
+      return {
+        code: err.code,
+        text: `Adapter tool call failed: ${err.code} (ToolCallError). ` +
+          "The target does not match any exposed adapter tool; correct the target " +
+          "(the adapter.<type>.<name>.tools[.<tool>] form) if possible.",
+      };
+    }
+    return {
+      code: err.code,
+      text: `Adapter tool call failed: call_error "${err.code}" (ToolCallError).`,
+    };
+  }
+  if (err instanceof ToolCallTimeoutError || err instanceof ToolCallStreamClosedError) {
+    return { text: `Adapter tool call failed (${err.name}): ${err.message}` };
+  }
+  return {
+    text: `Adapter tool call failed unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
+  };
+}
+
 /**
  * Build the MCP server that exposes `submit_outcome`. The tool handler performs
  * allowed-outcome validation, duplicate detection, and updates the shared
@@ -218,6 +301,52 @@ export function buildOutcomeMcpServer(options: BuildOutcomeServerOptions) {
           });
 
           return submitOutcomeSuccess(outcome, reason, heldSecrets);
+        },
+      },
+      {
+        name: ADAPTER_TOOL_TOOL_NAME,
+        description: ADAPTER_TOOL_DESCRIPTION,
+        inputSchema: {
+          target: z.string().describe("Full adapter.<type>.<name>.tools[.<tool>] target"),
+          args: z.record(z.string(), z.any()).optional(),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false },
+        handler: async (args: any) => {
+          const target = (args?.target ?? "").trim() as string;
+          const callArgs = args?.args as Record<string, unknown> | undefined;
+
+          if (!target) {
+            return adapterToolError(
+              "adapter_tool requires a target in the adapter.<type>.<name>.tools[.<tool>] form."
+            );
+          }
+
+          // ADR-0004 permission ordering: this call's permission.request IS the
+          // gated event — the host evaluates policy plus the callee adapter's
+          // own allow_tools against it. It is deliberately NOT routed through
+          // helpers.permission.request, which would double-gate the same call.
+          try {
+            // No timeoutMs override: the SDK helper bounds the call by its
+            // own DefaultToolCallTimeout.
+            const result = await helpers.tools.callAdapterTool({
+              target,
+              args: callArgs,
+            });
+
+            await helpers.log.adapterEvent("adapter_tool.call", {
+              target,
+              status: "ok",
+            });
+            return adapterToolSuccess(result.outcome, result.outputs);
+          } catch (err) {
+            const failure = describeAdapterToolFailure(err);
+            await helpers.log.adapterEvent("adapter_tool.call", {
+              target,
+              status: err instanceof ToolCallDeniedError ? "denied" : "error",
+              ...(failure.code ? { code: failure.code } : {}),
+            });
+            return adapterToolError(failure.text);
+          }
         },
       },
     ],

@@ -13,9 +13,8 @@ import {
 mockClaudeSdk();
 
 describe("permission handling", () => {
-  test("permission.request event payload includes non-empty snake_case request_id matching internal id", async () => {
-    let capturedSnake: string | undefined;
-    let capturedCamel: string | undefined;
+  test("permission.request event payload includes a non-empty requestId", async () => {
+    let capturedId: string | undefined;
 
     mock.module("@anthropic-ai/claude-agent-sdk", () => ({
       query: (opts: any) => ({
@@ -48,16 +47,14 @@ describe("permission handling", () => {
       stepName: "request-id-check",
       input: { prompt: "run git" },
       allowedOutcomes: ["success"],
-      onRequest: (reqId, permStream, payload) => {
-        capturedSnake = reqId;
-        capturedCamel = payload?.fields?.requestId?.stringValue as string | undefined;
+      onRequest: (reqId, permStream) => {
+        capturedId = reqId;
         permStream.write({ request: { requestId: reqId } });
       },
     });
 
-    expect(capturedSnake).toBeDefined();
-    expect(capturedSnake?.length).toBeGreaterThan(0);
-    expect(capturedCamel).toBe(capturedSnake);
+    expect(capturedId).toBeDefined();
+    expect(capturedId?.length).toBeGreaterThan(0);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
   });
@@ -109,7 +106,7 @@ describe("permission handling", () => {
     await host.stop();
   });
 
-  test("CRI-31: permission.request payload forwards full_command_text for Bash command", async () => {
+  test("CRI-31: permission.request payload carries the Bash command digest and preview", async () => {
     const commandText = "echo matched > /tmp/cri31-proof/PROOF.txt";
     let capturedPayload: Record<string, any> | undefined;
 
@@ -152,12 +149,15 @@ describe("permission handling", () => {
 
     expect(capturedPayload).toBeDefined();
     expect(capturedPayload?.tool).toBe("Bash");
-    expect(capturedPayload?.full_command_text).toBe(commandText);
+    // CRI-179 SDK contract: raw args no longer travel on the wire — a sha256
+    // args_digest plus a (possibly truncated) args_preview do.
+    expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ command: commandText }));
+    expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
   });
 
-  test("CRI-31: commands array is forwarded as a command fingerprint", async () => {
+  test("CRI-31: commands array is carried in the args digest and preview", async () => {
     const commands = ["echo one", "echo two"];
     let capturedPayload: Record<string, any> | undefined;
 
@@ -200,12 +200,13 @@ describe("permission handling", () => {
 
     expect(capturedPayload).toBeDefined();
     expect(capturedPayload?.tool).toBe("Bash");
-    expect(capturedPayload?.commands).toEqual(commands);
+    expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ commands }));
+    expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
   });
 
-  test("CRI-31: non-command tools omit full_command_text and commands", async () => {
+  test("CRI-31: non-command tool args are digested and previewed without command shapes", async () => {
     let capturedPayload: Record<string, any> | undefined;
 
     mock.module("@anthropic-ai/claude-agent-sdk", () => ({
@@ -247,6 +248,8 @@ describe("permission handling", () => {
 
     expect(capturedPayload).toBeDefined();
     expect(capturedPayload?.tool).toBe("Read");
+    expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ path: "/tmp/readme.md" }));
+    expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(capturedPayload).not.toHaveProperty("full_command_text");
     expect(capturedPayload).not.toHaveProperty("commands");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
@@ -407,7 +410,7 @@ describe("permission handling", () => {
     });
   }
 
-  test("host permission.granted with matching request_id resolves to allow in under 1 second", async () => {
+  test("host permission.granted with matching requestId resolves to allow in under 1 second", async () => {
     let canUseToolStart = 0;
     let canUseToolEnd = 0;
 
@@ -455,7 +458,7 @@ describe("permission handling", () => {
     await host.stop();
   });
 
-  test("host permission.denied with matching request_id resolves to deny in under 1 second", async () => {
+  test("host permission.denied with matching requestId resolves to deny in under 1 second", async () => {
     let canUseToolStart = 0;
     let canUseToolEnd = 0;
     let capturedBehavior: string | undefined;
