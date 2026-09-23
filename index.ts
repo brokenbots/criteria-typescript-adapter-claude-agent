@@ -66,6 +66,17 @@ const PLUGIN_VERSION = process.env.PLUGIN_VERSION ?? "0.0.0-dev";
  * omitted here is simply absent — without PATH and HOME the CLI cannot resolve
  * its own tools or read its credentials. The host environment is not forwarded
  * wholesale: the agent runs untrusted model output, so only these are shared.
+ *
+ * CLAUDE_CONFIG_DIR is the per-iteration isolation knob for parallel steps
+ * (CRI-301): the engine gives each parallel iteration its own adapter session
+ * and process, but sibling claude subprocesses still share `~/.claude` global
+ * state through HOME. To hard-isolate Claude Code's global state (session
+ * transcripts, `~/.claude.json`, shell snapshots) per iteration, set the
+ * per-step `claude_config_dir` input (or the adapter-level `claude_config_dir`
+ * config field as a default). The resolved value is forwarded to the
+ * subprocess in the explicit `env` block below, which takes precedence over
+ * this inherited host-env copy; the entry here remains the fallback when
+ * neither input nor config set it.
  */
 const ENV_PASSTHROUGH = [
   "PATH",
@@ -77,6 +88,7 @@ const ENV_PASSTHROUGH = [
   "LC_ALL",
   "TERM",
   "TMPDIR",
+  "CLAUDE_CONFIG_DIR",
 ] as const;
 
 
@@ -452,6 +464,17 @@ async function executeStep(
   const baseURL =
     helpers.session.get<string>("baseUrl") || process.env.ANTHROPIC_BASE_URL || undefined;
 
+  // CLAUDE_CONFIG_DIR for the subprocess: per-step `input.claude_config_dir`
+  // overrides the adapter-level `config.claude_config_dir` (session), which in
+  // turn overrides the inherited host env. This is the per-iteration isolation
+  // knob for parallel steps (CRI-301): distinct values give sibling
+  // subprocesses distinct `~/.claude` global-state directories.
+  const resolvedClaudeConfigDir =
+    (req.input.claude_config_dir as string | undefined) ||
+    helpers.session.get<string>("claudeConfigDir") ||
+    process.env.CLAUDE_CONFIG_DIR ||
+    undefined;
+
   const buildOptions = (resume: string | undefined) => ({
     abortController,
     systemPrompt: { type: "preset" as const, preset: "claude_code" as const, append: systemPromptAppend },
@@ -476,6 +499,10 @@ async function executeStep(
       ...(apiKey ? { ANTHROPIC_API_KEY: apiKey } : {}),
       ...(baseURL ? { ANTHROPIC_BASE_URL: baseURL } : {}),
       ...(authToken ? { ANTHROPIC_AUTH_TOKEN: authToken } : {}),
+      // Overrides the passthrough copy: when the per-iteration
+      // `claude_config_dir` input or config is set, it wins over the value
+      // inherited from the host environment.
+      ...(resolvedClaudeConfigDir ? { CLAUDE_CONFIG_DIR: resolvedClaudeConfigDir } : {}),
     },
   });
 
@@ -551,7 +578,16 @@ export const adapterConfig = {
   description: "Claude Code agent adapter for Criteria workflows.",
 
   source_url: "https://github.com/brokenbots/criteria-typescript-adapter-claude-agent",
-  capabilities: ["multi_turn", "tool_calling", "structured_events", CAPABILITY_ADAPTER_TOOLS],
+  // parallel_safe (CRI-301): the adapter vouches for concurrent Execute calls
+  // within the boundaries verified by tests/parallel.test.ts — per-session
+  // resume isolation, per-requestId permission correlation, distinct claude
+  // session ids, and per-iteration CLAUDE_CONFIG_DIR isolation when the
+  // workflow author opts in via the `claude_config_dir` input. Concurrent
+  // writes to the host's inherited `~/.claude` global state (transcripts,
+  // `~/.claude.json`, shell snapshots) remain uncoordinated between sibling
+  // subprocesses when `claude_config_dir` is not set per iteration; this is an
+  // accepted residual risk documented in the workstream verdict.
+  capabilities: ["multi_turn", "tool_calling", "structured_events", CAPABILITY_ADAPTER_TOOLS, "parallel_safe"],
   platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
 
   secrets: [
@@ -578,6 +614,7 @@ export const adapterConfig = {
       claude_executable: { type: "string", required: false, description: "Path to the Claude Code CLI. Defaults to `claude` on PATH." },
       base_url: { type: "string", required: false, description: "Override the Anthropic API base URL. Falls back to the ANTHROPIC_BASE_URL environment variable." },
       step_timeout_ms: { type: "number", required: false, description: "Maximum time in milliseconds to wait for the agent to submit an outcome. When exceeded, the adapter aborts the query and emits a timeout outcome. No timeout when unset." },
+      claude_config_dir: { type: "string", required: false, description: "Per-iteration override for the Claude Code global-state directory. When set, the adapter passes it to the claude subprocess as CLAUDE_CONFIG_DIR, taking precedence over any inherited value. Useful for hard isolation between concurrent parallel iterations." },
     },
   },
 
@@ -587,6 +624,7 @@ export const adapterConfig = {
       model: { type: "string", required: false, description: "Per-step model override" },
       cwd: { type: "string", required: false, description: "Per-step working directory override. Takes precedence over config.cwd." },
       timeout_ms: { type: "number", required: false, description: "Per-step override for the maximum time in milliseconds to wait for an outcome. Takes precedence over config.step_timeout_ms." },
+      claude_config_dir: { type: "string", required: false, description: "Per-iteration override for the Claude Code global-state directory. When set, the adapter passes it to the claude subprocess as CLAUDE_CONFIG_DIR, taking precedence over any inherited value. Useful for hard isolation between concurrent parallel iterations." },
     },
   },
 
@@ -625,6 +663,7 @@ export const adapterConfig = {
     helpers.session.set("reasoningEffort", reasoningEffort || undefined);
     helpers.session.set("claudeExecutable", req.config.claude_executable || undefined);
     helpers.session.set("baseUrl", req.config.base_url || undefined);
+    helpers.session.set("claudeConfigDir", req.config.claude_config_dir || undefined);
     helpers.session.set("stepTimeoutMs", resolveTimeoutMs(req.config.step_timeout_ms as unknown) ?? undefined);
     helpers.session.set(
       "systemPromptAppend",
@@ -650,6 +689,7 @@ export const adapterConfig = {
       systemPromptAppend: helpers.session.get<string>("systemPromptAppend") ?? undefined,
       baseUrl: helpers.session.get<string>("baseUrl") ?? undefined,
       claudeExecutable: helpers.session.get<string>("claudeExecutable") ?? undefined,
+      claudeConfigDir: helpers.session.get<string>("claudeConfigDir") ?? undefined,
       stepTimeoutMs: helpers.session.get<number>("stepTimeoutMs") ?? undefined,
     };
     const state = new TextEncoder().encode(JSON.stringify(payload));
@@ -674,6 +714,7 @@ export const adapterConfig = {
     helpers.session.set("systemPromptAppend", snapshot.systemPromptAppend as string | undefined);
     helpers.session.set("baseUrl", snapshot.baseUrl as string | undefined);
     helpers.session.set("claudeExecutable", snapshot.claudeExecutable as string | undefined);
+    helpers.session.set("claudeConfigDir", snapshot.claudeConfigDir as string | undefined);
     helpers.session.set("stepTimeoutMs", snapshot.stepTimeoutMs as number | undefined);
   },
 };
