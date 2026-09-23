@@ -66,6 +66,14 @@ const PLUGIN_VERSION = process.env.PLUGIN_VERSION ?? "0.0.0-dev";
  * omitted here is simply absent — without PATH and HOME the CLI cannot resolve
  * its own tools or read its credentials. The host environment is not forwarded
  * wholesale: the agent runs untrusted model output, so only these are shared.
+ *
+ * CLAUDE_CONFIG_DIR is the per-iteration isolation knob for parallel steps
+ * (CRI-301): the engine gives each parallel iteration its own adapter session
+ * and process, but sibling claude subprocesses still share `~/.claude` global
+ * state through HOME. Workflow authors who need hard per-iteration isolation of
+ * Claude Code's global state (session transcripts, `~/.claude.json`, shell
+ * snapshots) can point each environment's CLAUDE_CONFIG_DIR at a distinct
+ * directory; the adapter forwards it verbatim when set.
  */
 const ENV_PASSTHROUGH = [
   "PATH",
@@ -77,6 +85,7 @@ const ENV_PASSTHROUGH = [
   "LC_ALL",
   "TERM",
   "TMPDIR",
+  "CLAUDE_CONFIG_DIR",
 ] as const;
 
 
@@ -551,7 +560,15 @@ export const adapterConfig = {
   description: "Claude Code agent adapter for Criteria workflows.",
 
   source_url: "https://github.com/brokenbots/criteria-typescript-adapter-claude-agent",
-  capabilities: ["multi_turn", "tool_calling", "structured_events", CAPABILITY_ADAPTER_TOOLS],
+  // parallel_safe (CRI-301): the adapter vouches for concurrent Execute calls.
+  // Every parallel iteration runs in its own adapter session and process (the
+  // engine opens a fresh SessionManager per iteration), all per-execute state
+  // is request-scoped, cross-execute state lives in helpers.session (per
+  // session), and the permission bridge correlates in-flight requests by
+  // requestId rather than assuming a single outstanding request. Each execute
+  // also spawns its own claude subprocess with a fresh session id, so
+  // transcript files never collide; see tests/parallel.test.ts.
+  capabilities: ["multi_turn", "tool_calling", "structured_events", CAPABILITY_ADAPTER_TOOLS, "parallel_safe"],
   platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
 
   secrets: [
