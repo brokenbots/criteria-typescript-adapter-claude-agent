@@ -106,6 +106,28 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
   return typeof value === "string" && VALID_REASONING_EFFORTS.includes(value as ReasoningEffort);
 }
 
+// ============================================================================
+// Concurrent-execute resume gate (CRI-306)
+// ============================================================================
+
+/**
+ * In-flight Execute count per wire session, keyed by the wire sessionId.
+ *
+ * A host running adapter-target parallel steps multiplexes several concurrent
+ * Execute calls over ONE wire session, but `claudeSessionId` is a single
+ * session-store value that can only carry one resume chain: every overlapping
+ * Execute resuming it would interleave all iterations into one Claude Code
+ * transcript. The first Execute to arrive on a session resumes the stored
+ * conversation exactly as the sequential path always has (sequential
+ * multi_turn is unchanged); a sibling arriving while it is still in flight
+ * runs a FRESH conversation and must not publish its session id onto the
+ * shared chain. The engine keeps one adapter process per wire session, so
+ * this tracking is process-level in the engine's topology; keying by
+ * sessionId additionally keeps multi-session processes (as exercised by
+ * tests/parallel.test.ts) correct.
+ */
+const inFlightExecutes = new Map<string, number>();
+
 /**
  * Validate and normalize a reasoning_effort value. Returns undefined when the
  * input is undefined/null/empty. Throws a clear error for unsupported values.
@@ -400,9 +422,40 @@ async function executeStep(
     throw new Error("input.prompt is required");
   }
 
+  // CRI-306: decide the resume chain per execute. The decision is
+  // synchronous before any await, so concurrent Executes arriving on the
+  // same session cannot race it: the first one to start sees no sibling in
+  // flight and takes over the shared resume chain; any sibling starting
+  // while it runs gets a fresh conversation.
+  const sharesResumeChain = (inFlightExecutes.get(req.sessionId) ?? 0) === 0;
+  inFlightExecutes.set(req.sessionId, (inFlightExecutes.get(req.sessionId) ?? 0) + 1);
+  try {
+    await runExecuteStep(req, helpers, sharesResumeChain);
+  } finally {
+    const remaining = (inFlightExecutes.get(req.sessionId) ?? 1) - 1;
+    if (remaining <= 0) inFlightExecutes.delete(req.sessionId);
+    else inFlightExecutes.set(req.sessionId, remaining);
+  }
+}
+
+async function runExecuteStep(
+  req: ExecuteRequest,
+  helpers: Helpers,
+  sharesResumeChain: boolean
+): Promise<void> {
+  const prompt = req.input.prompt;
+  if (!prompt) {
+    throw new Error("input.prompt is required");
+  }
+
   // Reset per-execution state
   let lastResultText = "";
-  let claudeSessionId = helpers.session.get<string | null>("claudeSessionId") ?? null;
+  // A concurrent sibling starts a fresh conversation: it must not resume the
+  // chain its in-flight sibling owns, and its session id is never published
+  // onto that chain (gated in runQuery below).
+  let claudeSessionId = sharesResumeChain
+    ? helpers.session.get<string | null>("claudeSessionId") ?? null
+    : null;
 
   const allowedOutcomes = req.allowedOutcomes ?? [];
   const outcomeInstructions = buildOutcomeInstructions(allowedOutcomes);
@@ -524,8 +577,12 @@ async function executeStep(
       }
       await helpers.log.stderr(`[claude-agent] Query error: ${err.message}\n`);
     } finally {
-      // Persist session ID for resume
-      helpers.session.set("claudeSessionId", streamState.claudeSessionId);
+      // Persist session ID for resume. A concurrent sibling runs a fresh
+      // conversation and must not overwrite the shared chain its sibling
+      // owns and will keep resuming (CRI-306).
+      if (sharesResumeChain) {
+        helpers.session.set("claudeSessionId", streamState.claudeSessionId);
+      }
       helpers.session.set("lastResultText", streamState.lastResultText);
     }
   };
@@ -587,6 +644,12 @@ export const adapterConfig = {
   // `~/.claude.json`, shell snapshots) remain uncoordinated between sibling
   // subprocesses when `claude_config_dir` is not set per iteration; this is an
   // accepted residual risk documented in the workstream verdict.
+  //
+  // CRI-306: concurrent Executes multiplexed onto ONE session keep the shared
+  // resume chain intact — the first execute in flight resumes it, siblings
+  // run fresh conversations and never publish their session ids onto it
+  // (runExecuteStep/runQuery). Sibling conversations are therefore
+  // deliberately not resumed on any later step.
   capabilities: ["multi_turn", "tool_calling", "structured_events", CAPABILITY_ADAPTER_TOOLS, "parallel_safe"],
   platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
 
