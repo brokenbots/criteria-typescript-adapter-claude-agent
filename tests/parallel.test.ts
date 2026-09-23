@@ -25,6 +25,13 @@ import {
  *    `claude_config_dir` input reaches its own subprocess env, so sibling
  *    subprocesses never share a Claude Code global-state directory.
  *
+ * CRI-306 extends this suite to the engine's actual parallel topology for
+ * adapter-target steps: TWO concurrent Executes multiplexed onto ONE wire
+ * session. The shared `claudeSessionId` store value can only carry one resume
+ * chain, so the adapter must run overlapping executes as fresh conversations
+ * without publishing their session ids onto the chain — otherwise every
+ * iteration resumes and interleaves into the same transcript.
+ *
  * The engine additionally gives every parallel iteration its own fresh
  * SessionManager, which spawns a fresh adapter process per resolve
  * (internal/adapterhost/loader.go), so these tests are deliberately stricter
@@ -419,6 +426,220 @@ describe("concurrent execute isolation (CRI-301)", () => {
     // though they inherit the same host env.
     expect(byMarker.get("A")?.envKey).toBe("/isolated-config-dir-A");
     expect(byMarker.get("B")?.envKey).toBe("/isolated-config-dir-B");
+    await host.closeSession();
+    await host.stop();
+  });
+});
+
+// ============================================================================
+// Concurrent executes on ONE session (CRI-306)
+// ============================================================================
+
+/**
+ * Marker extracted from a test prompt so the mocked SDK can answer per
+ * execute with its own conversation identity. Reprompt prompts carry no
+ * marker word, so they are classified by the conversation they resume.
+ */
+function markerOf(prompt: string, resume?: string): string {
+  const marker = /\b(seed|owner|sibling|after)\b/.exec(prompt)?.[1];
+  if (marker) return marker;
+  return resume ? resume.replace(/^claude-/, "") : "unknown";
+}
+
+/** Poll until `fn()` is true or the deadline expires. */
+async function waitFor(fn: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!fn()) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error("condition not met within timeout");
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+describe("concurrent executes on one session (CRI-306)", () => {
+  test("sibling execute runs a fresh conversation and never publishes its session id", async () => {
+    interface QueryRecord {
+      marker: string;
+      resume: string | undefined;
+    }
+    const queries: QueryRecord[] = [];
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const marker = markerOf(String(opts.prompt), opts.options?.resume);
+          const resume = opts.options?.resume as string | undefined;
+          queries.push({ marker, resume });
+
+          // Finalize this execute through the MCP tool, like the real agent
+          // would, so each concurrent iteration completes on its own stream
+          // with its own outcome (the SDK's per-call routing is a
+          // prerequisite the CRI-305 fix provides).
+          const { mcpServers, allowedTools } = opts.options || {};
+          for (const toolRef of allowedTools ?? []) {
+            const toolName = String(toolRef).split("__").pop();
+            if (toolName !== "submit_outcome") continue;
+            const server = mcpServers?.[Object.keys(mcpServers)[0]];
+            const tool = server?.tools?.find((t: any) => t.name === "submit_outcome");
+            if (tool?.handler) {
+              await tool.handler({ outcome: "success", reason: `done-${marker}` });
+            }
+          }
+
+          // Hold the owner long enough for the sibling execute to arrive and
+          // start while the owner is provably in flight.
+          if (marker === "owner") await new Promise((r) => setTimeout(r, 60));
+          yield {
+            type: "result",
+            subtype: "success",
+            result: `done-${marker}`,
+            duration_ms: 10,
+            num_turns: 1,
+            total_cost_usd: 0,
+            session_id: `claude-${marker}`,
+          };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig });
+    await host.start();
+    const client = (host as any).client;
+
+    await host.openSession({ sessionId: "session-one", config: { claude_executable: FAKE_CLI } });
+
+    // Round 1 (sequential): establishes the shared resume chain.
+    await executeOnSession(client, {
+      sessionId: "session-one",
+      stepName: "seed",
+      input: { prompt: "seed step" },
+      allowedOutcomes: ["success"],
+    });
+    expect(queries).toEqual([{ marker: "seed", resume: undefined }]);
+
+    // Round 2: TWO concurrent executes on the SAME session. Start the owner
+    // first and only launch the sibling once the owner's query is running, so
+    // the owner/sibling roles are deterministic.
+    const ownerDone = executeOnSession(client, {
+      sessionId: "session-one",
+      stepName: "owner",
+      input: { prompt: "owner task" },
+      allowedOutcomes: ["success"],
+    });
+    await waitFor(() => queries.length >= 2);
+
+    const siblingDone = executeOnSession(client, {
+      sessionId: "session-one",
+      stepName: "sibling",
+      input: { prompt: "sibling task" },
+      allowedOutcomes: ["success"],
+    });
+    const [ownerResult, siblingResult] = await Promise.all([ownerDone, siblingDone]);
+
+    // The owner resumes the stored chain; the sibling starts fresh even
+    // though the store holds claude-seed at that moment.
+    expect(queries[1]).toEqual({ marker: "owner", resume: "claude-seed" });
+    expect(queries[2]).toEqual({ marker: "sibling", resume: undefined });
+
+    // Each iteration completes with its own outcome on its own stream: no
+    // cross-routed finalize, no transcript interleaving.
+    expect(ownerResult.outcome).toBe("success");
+    expect(siblingResult.outcome).toBe("success");
+    expect(ownerResult.outputs.reason).toBe("done-owner");
+    expect(siblingResult.outputs.reason).toBe("done-sibling");
+
+    // Round 3 (sequential): the next execute resumes the owner's chain
+    // (claude-owner, republished by the owner), NOT the sibling's fresh
+    // conversation and NOT the stale seed.
+    await executeOnSession(client, {
+      sessionId: "session-one",
+      stepName: "after",
+      input: { prompt: "after step" },
+      allowedOutcomes: ["success"],
+    });
+    expect(queries[3]).toEqual({ marker: "after", resume: "claude-owner" });
+
+    await host.closeSession();
+    await host.stop();
+  });
+
+  test("reprompt attempts follow the same per-execute conversation for owner and sibling", async () => {
+    const queries: { marker: string; resume: string | undefined }[] = [];
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const marker = markerOf(String(opts.prompt), opts.options?.resume);
+          const resume = opts.options?.resume as string | undefined;
+          queries.push({ marker, resume });
+          if (marker === "owner") await new Promise((r) => setTimeout(r, 40));
+          // Never finalizes: the adapter exhausts MAX_FINALIZE_ATTEMPTS (1
+          // initial + 2 reprompts), each resuming the SAME per-execute
+          // conversation.
+          yield {
+            type: "result",
+            subtype: "success",
+            result: `done-${marker}`,
+            duration_ms: 10,
+            num_turns: 1,
+            total_cost_usd: 0,
+            session_id: `claude-${marker}`,
+          };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const mod = await import(`${adapterPath}?${Date.now()}`);
+    const host = new TestHost({ config: mod.adapterConfig });
+    await host.start();
+    const client = (host as any).client;
+
+    await host.openSession({ sessionId: "session-one", config: { claude_executable: FAKE_CLI } });
+
+    await executeOnSession(client, {
+      sessionId: "session-one",
+      stepName: "seed",
+      input: { prompt: "seed step" },
+      allowedOutcomes: [],
+    });
+
+    const ownerDone = executeOnSession(client, {
+      sessionId: "session-one",
+      stepName: "owner",
+      input: { prompt: "owner task" },
+      allowedOutcomes: ["success"],
+    });
+    // The owner runs 1 initial + 2 reprompt queries; wait until its initial
+    // query is in flight before starting the sibling.
+    await waitFor(() => queries.length >= 2);
+
+    const siblingDone = executeOnSession(client, {
+      sessionId: "session-one",
+      stepName: "sibling",
+      input: { prompt: "sibling task" },
+      allowedOutcomes: ["success"],
+    });
+    await Promise.all([ownerDone, siblingDone]);
+
+    const byMarker = new Map<string, (string | undefined)[]>();
+    for (const q of queries) {
+      if (!byMarker.has(q.marker)) byMarker.set(q.marker, []);
+      byMarker.get(q.marker)!.push(q.resume);
+    }
+
+    // Owner: resumes the stored chain, then its own conversation for both
+    // reprompt attempts.
+    expect(byMarker.get("owner")).toEqual(["claude-seed", "claude-owner", "claude-owner"]);
+    // Sibling: fresh conversation, then reprompts follow ITS OWN conversation
+    // (claude-sibling), never the owner's chain.
+    expect(byMarker.get("sibling")).toEqual([undefined, "claude-sibling", "claude-sibling"]);
+
     await host.closeSession();
     await host.stop();
   });

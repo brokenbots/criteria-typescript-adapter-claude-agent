@@ -444,9 +444,6 @@ async function runExecuteStep(
   sharesResumeChain: boolean
 ): Promise<void> {
   const prompt = req.input.prompt;
-  if (!prompt) {
-    throw new Error("input.prompt is required");
-  }
 
   // Reset per-execution state
   let lastResultText = "";
