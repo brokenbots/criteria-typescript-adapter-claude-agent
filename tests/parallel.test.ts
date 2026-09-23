@@ -21,6 +21,9 @@ import {
  *    their per-session state (resume chains) isolated — no cross-session bleed.
  * 3. Concurrent in-flight permission requests are correlated per requestId —
  *    each bridge receives its own decision, not its sibling's.
+ * 4. Concurrent executes keep per-iteration env isolation: each session's
+ *    `claude_config_dir` input reaches its own subprocess env, so sibling
+ *    subprocesses never share a Claude Code global-state directory.
  *
  * The engine additionally gives every parallel iteration its own fresh
  * SessionManager, which spawns a fresh adapter process per resolve
@@ -371,7 +374,7 @@ describe("concurrent execute isolation (CRI-301)", () => {
     const client = (host as any).client;
 
     // Distinct per-session config: each session carries its own model and
-    // CLAUDE_CONFIG_DIR, mimicking per-iteration environments in a parallel
+    // claude_config_dir, mimicking per-iteration environments in a parallel
     // fan-out.
     await host.openSession({
       sessionId: "session-A",
@@ -382,20 +385,23 @@ describe("concurrent execute isolation (CRI-301)", () => {
       config: { claude_executable: FAKE_CLI, model: "model-B" },
     });
 
+    // The host env carries a third, distinct value: if the per-step input were
+    // not honored, both siblings would fall back to this shared value — the
+    // shared-global-state case the per-iteration knob exists to avoid.
     const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
-    process.env.CLAUDE_CONFIG_DIR = "/isolated-config-dir";
+    process.env.CLAUDE_CONFIG_DIR = "/host-env-config-dir";
     try {
       await Promise.all([
         executeOnSession(client, {
           sessionId: "session-A",
           stepName: "a",
-          input: { prompt: "run session-A" },
+          input: { prompt: "run session-A", claude_config_dir: "/isolated-config-dir-A" },
           allowedOutcomes: [],
         }),
         executeOnSession(client, {
           sessionId: "session-B",
           stepName: "b",
-          input: { prompt: "run session-B" },
+          input: { prompt: "run session-B", claude_config_dir: "/isolated-config-dir-B" },
           allowedOutcomes: [],
         }),
       ]);
@@ -407,9 +413,12 @@ describe("concurrent execute isolation (CRI-301)", () => {
     const byMarker = new Map(captured.map((c) => [c.marker, c]));
     expect(byMarker.get("A")?.model).toBe("model-A");
     expect(byMarker.get("B")?.model).toBe("model-B");
-    // The per-iteration isolation knob reaches each subprocess env.
-    expect(byMarker.get("A")?.envKey).toBe("/isolated-config-dir");
-    expect(byMarker.get("B")?.envKey).toBe("/isolated-config-dir");
+    // Per-iteration isolation of Claude Code global state (CRI-301): each
+    // concurrent sibling's claude_config_dir input reaches its own subprocess
+    // env, so sibling subprocesses never share a global-state directory even
+    // though they inherit the same host env.
+    expect(byMarker.get("A")?.envKey).toBe("/isolated-config-dir-A");
+    expect(byMarker.get("B")?.envKey).toBe("/isolated-config-dir-B");
     await host.closeSession();
     await host.stop();
   });

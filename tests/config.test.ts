@@ -470,10 +470,11 @@ describe("config and secrets", () => {
     }
   });
 
-  test("CLAUDE_CONFIG_DIR is forwarded to the subprocess for per-iteration state isolation", async () => {
-    // CRI-301 parallel guard: workflow authors can point each environment's
-    // CLAUDE_CONFIG_DIR at a distinct directory so concurrent claude
-    // subprocesses do not share ~/.claude global state.
+  test("session claude_config_dir config is forwarded to the subprocess as CLAUDE_CONFIG_DIR", async () => {
+    // CRI-301 parallel guard: the adapter-level `claude_config_dir` config
+    // field (stored on the session) is the explicit channel for the
+    // subprocess's CLAUDE_CONFIG_DIR — it is forwarded even when the host env
+    // does not carry the variable at all.
     let capturedEnv: Record<string, string> | undefined;
 
     mock.module("@anthropic-ai/claude-agent-sdk", () => ({
@@ -489,7 +490,91 @@ describe("config and secrets", () => {
     }));
 
     const previous = process.env.CLAUDE_CONFIG_DIR;
-    process.env.CLAUDE_CONFIG_DIR = "/tmp/claude-iteration-1";
+    delete process.env.CLAUDE_CONFIG_DIR;
+    try {
+      const mod = await import(`${adapterPath}?${Date.now()}`);
+      const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+      await host.start();
+
+      await host.openSession({
+        config: { claude_executable: FAKE_CLI, claude_config_dir: "/tmp/claude-config-dir-session" },
+      });
+      await host.execute({
+        stepName: "config-dir-forward",
+        input: { prompt: "test" },
+        allowedOutcomes: ["success"],
+      });
+
+      expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe("/tmp/claude-config-dir-session");
+      await host.stop();
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
+    }
+  });
+
+  test("session claude_config_dir config overrides the host CLAUDE_CONFIG_DIR env", async () => {
+    // CRI-301 precedence: when both the session config and the host env
+    // provide a value, the explicit session-config channel wins — the
+    // inherited host env is only a fallback.
+    let capturedEnv: Record<string, string> | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedEnv = opts.options?.env;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = "/tmp/claude-config-dir-host-env";
+    try {
+      const mod = await import(`${adapterPath}?${Date.now()}`);
+      const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
+      await host.start();
+
+      await host.openSession({
+        config: { claude_executable: FAKE_CLI, claude_config_dir: "/tmp/claude-config-dir-session" },
+      });
+      await host.execute({
+        stepName: "config-dir-precedence",
+        input: { prompt: "test" },
+        allowedOutcomes: ["success"],
+      });
+
+      expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe("/tmp/claude-config-dir-session");
+      await host.stop();
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
+    }
+  });
+
+  test("CLAUDE_CONFIG_DIR falls back to the host env when no config override is set", async () => {
+    // Final link of the CRI-301 precedence chain (input > session config >
+    // host env): with neither the input nor the session config set, the
+    // inherited host env value still reaches the subprocess.
+    let capturedEnv: Record<string, string> | undefined;
+
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          capturedEnv = opts.options?.env;
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = "/tmp/claude-config-dir-host-env";
     try {
       const mod = await import(`${adapterPath}?${Date.now()}`);
       const host = new TestHost({ config: mod.adapterConfig, autoGrantPermissions: true });
@@ -497,12 +582,12 @@ describe("config and secrets", () => {
 
       await host.openSession({ config: { claude_executable: FAKE_CLI } });
       await host.execute({
-        stepName: "config-dir-forward",
+        stepName: "config-dir-host-env-fallback",
         input: { prompt: "test" },
         allowedOutcomes: ["success"],
       });
 
-      expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe("/tmp/claude-iteration-1");
+      expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe("/tmp/claude-config-dir-host-env");
       await host.stop();
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
