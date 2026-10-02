@@ -310,6 +310,10 @@ describe("contract context build + identity cache", () => {
     expect(ctx.byName.has("plain")).toBe(true);
   });
 
+  test("a list whose every entry is unusable is legacy mode, not an empty contract set", () => {
+    expect(buildContractModeContext({ outcomeContracts: [{ name: "" }, null, "nope", {}] })).toBeNull();
+  });
+
   test("schema_json parses once per identity: duplicate entries share the parsed view", () => {
     const req = {
       outcomeContracts: [

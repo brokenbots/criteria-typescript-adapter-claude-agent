@@ -304,6 +304,13 @@ export function buildContractModeContext(req: any): ContractModeContext | null {
     }
   }
 
+  // An entry list whose every record was unusable (missing/blank names) is
+  // not contract mode: fall back to the legacy flow instead of rejecting
+  // every submission as uncontracted.
+  if (contracts.length === 0) {
+    return null;
+  }
+
   return { hasContracts: true, contracts, byName, fallback };
 }
 
