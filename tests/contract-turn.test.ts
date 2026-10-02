@@ -10,7 +10,7 @@
  */
 import { describe, test, expect, mock } from "bun:test";
 import { FAKE_CLI, adapterPath } from "./helpers.js";
-import { SUBMIT_OUTCOME_TOOL_NAME } from "../contract.js";
+import { missingCommentIssue, SUBMIT_OUTCOME_TOOL_NAME } from "../contract.js";
 import { MAX_FINALIZE_ATTEMPTS } from "../outcome.js";
 
 // ---------------------------------------------------------------------------
@@ -506,5 +506,82 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     expect(helpers.finalizeCalls).toEqual([
       { outcome: "completed", opts: { comment: "c", payload: { summary: "s", commit: "c" } } },
     ]);
+  });
+
+  test("K: an empty schema_json (zero-length bytes) carries no payload contract — the turn still finalizes end-to-end", async () => {
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", comment: "done", payload: { summary: "ok", commit: "abc123" } }],
+      hang: true,
+      sessionId: "sess-k",
+    });
+    await execute(
+      contractReq(
+        {
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.alloc(0) },
+            { name: "failed", schema_json: Buffer.alloc(0) },
+            { name: "gave_up", fallback: true },
+          ],
+        },
+        "sess-k"
+      ),
+      helpers
+    );
+
+    // Empty bytes = no payload contract: the first submission is accepted
+    // (payload forwarded verbatim) as the terminal finalize, not burned as
+    // ISSUE_BAD_SCHEMA.
+    expect(captured[0].hangObserved).toBe(true);
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+    expect(eventsOf(helpers, "outcome.finalized")).toEqual([
+      { outcome: "completed", reason: "done" },
+    ]);
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "completed", opts: { comment: "done", payload: { summary: "ok", commit: "abc123" } } },
+    ]);
+    expect(handlerResults[0].isError).toBeFalsy();
+    expect(handlerResults[0].metadata.outcome).toBe("completed");
+  });
+
+  test(`L: an empty-schema require_comment contract burns budget on missing_comment only and the fallback fires`, async () => {
+    const helpers = startTurn({
+      calls: [
+        { outcome: "completed", payload: {} },
+        { outcome: "completed", payload: { anything: 1 } },
+        { outcome: "completed", payload: { anything: [1, "two", null] } },
+      ],
+      sessionId: "sess-l",
+    });
+    await execute(
+      contractReq(
+        {
+          outcomeContracts: [
+            { name: "completed", require_comment: true, schema_json: "" },
+            { name: "gave_up", fallback: true },
+          ],
+        },
+        "sess-l"
+      ),
+      helpers
+    );
+
+    // Without the empty-schema normalization every call would have been
+    // poisoned by payload_schema: contract schema_json is not a valid schema;
+    // only the require_comment gate rejects here.
+    const invalid = eventsOf(helpers, "outcome.payload_invalid");
+    expect(invalid).toHaveLength(MAX_FINALIZE_ATTEMPTS);
+    expect(invalid.map((e: any) => e.issues)).toEqual(
+      Array.from({ length: MAX_FINALIZE_ATTEMPTS }, () => [missingCommentIssue("completed")])
+    );
+
+    expect(handlerResults[MAX_FINALIZE_ATTEMPTS - 1].isError).toBeFalsy();
+    expect(handlerResults[MAX_FINALIZE_ATTEMPTS - 1].metadata.outcome).toBe("gave_up");
+    expect(helpers.finalizeCalls).toHaveLength(1);
+    expect(helpers.finalizeCalls[0].outcome).toBe("gave_up");
+    expect(helpers.finalizeCalls[0].opts.reason).toContain(
+      `payload validation failed ${MAX_FINALIZE_ATTEMPTS} times`
+    );
+    expect(helpers.finalizeCalls[0].opts.reason).toContain("requires a comment");
+    expect(helpers.finalizeCalls[0].opts.reason).not.toContain("not a valid schema");
   });
 });

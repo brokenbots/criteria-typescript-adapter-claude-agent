@@ -265,21 +265,33 @@ export function buildContractModeContext(req: any): ContractModeContext | null {
     const key = String(rawSchema === undefined || rawSchema === null ? "\u0000absent" : identityKey(rawSchema));
     let cached = cache.get(key);
     if (cached === undefined) {
-      let schemaText: string | null = null;
-      if (typeof rawSchema === "string") {
-        schemaText = rawSchema;
-      } else if (rawSchema instanceof Uint8Array) {
-        schemaText = Buffer.from(rawSchema).toString("utf8");
+      if (rawSchema === undefined || rawSchema === null) {
+        cached = { schemaText: null, parsed: null, schemaInvalid: false };
+      } else if (typeof rawSchema === "string" || rawSchema instanceof Uint8Array) {
+        const decoded = typeof rawSchema === "string"
+          ? rawSchema
+          : Buffer.from(rawSchema).toString("utf8");
+        if (decoded === "") {
+          // Zero-length text (an empty bytes field, or an already-decoded "")
+          // carries no payload contract per the proto: outputs_json is
+          // forwarded verbatim, so the invalid-schema lane must not fire and
+          // burn the finalize budget. It is an empty (valid) schema, not a
+          // parse failure. Whitespace-only text is NOT empty and still takes
+          // the invalid-schema lane below.
+          cached = {
+            schemaText: null,
+            parsed: { required: [], properties: {} },
+            schemaInvalid: false,
+          };
+        } else {
+          const parsed = parseOutcomeSchemaText(decoded);
+          cached = { schemaText: decoded, parsed, schemaInvalid: parsed === null };
+        }
+      } else {
+        // Anything non-empty that is neither text nor bytes (a decoder artifact)
+        // is surfaced as a schema that does not parse rather than "no schema".
+        cached = { schemaText: null, parsed: null, schemaInvalid: true };
       }
-      // Anything non-empty that is neither text nor bytes (a decoder artifact)
-      // is surfaced as a schema that does not parse rather than "no schema".
-      const hasSchemaValue = rawSchema !== undefined && rawSchema !== null && rawSchema !== "";
-      const parsed = parseOutcomeSchemaText(schemaText);
-      cached = {
-        schemaText,
-        parsed,
-        schemaInvalid: hasSchemaValue && (schemaText === null || parsed === null),
-      };
       cache.set(key, cached);
     }
 

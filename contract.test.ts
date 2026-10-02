@@ -232,6 +232,65 @@ describe("payload lanes", () => {
   });
 });
 
+describe("empty schema on the wire (empty bytes = no payload contract)", () => {
+  // Per the proto (OutcomeContract.schema_json): an empty bytes field — or an
+  // already-decoded "" — means the outcome carries no payload contract and its
+  // outputs_json is forwarded verbatim. Every zero-length wire shape must
+  // collapse to that absent-schema view, never ISSUE_BAD_SCHEMA.
+
+  function expectAbsentSchemaView(view: OutcomeContractView): void {
+    expect(view.schemaText).toBeNull();
+    // The empty (valid) schema — parseOutcomeSchemaText("null"). Inert for
+    // validation (payloadSchemaIssues short-circuits on schemaText === null);
+    // what pins "no contract" is schemaText === null + schemaInvalid false.
+    expect(view.parsed).toEqual({ required: [], properties: {} });
+    expect(view.schemaInvalid).toBe(false);
+  }
+
+  test("empty string schema collapses to the absent-schema view; payloads forward verbatim", () => {
+    const ctx = ctxOf([{ name: "completed", schemaJson: "" }]);
+    expectAbsentSchemaView(ctx.byName.get("completed")!);
+    expect(payloadSchemaIssues(ctx.byName.get("completed")!, { anything: 1 })).toEqual([]);
+  });
+
+  test("zero-length bytes schema (Buffer.alloc(0)) collapses to the absent-schema view", () => {
+    const ctx = ctxOf([{ name: "completed", schemaJson: Buffer.alloc(0) }]);
+    expectAbsentSchemaView(ctx.byName.get("completed")!);
+    expect(payloadSchemaIssues(ctx.byName.get("completed")!, { anything: 1 })).toEqual([]);
+  });
+
+  test("empty Uint8Array schema collapses to the absent-schema view", () => {
+    const ctx = ctxOf([{ name: "completed", schemaJson: new Uint8Array(0) }]);
+    expectAbsentSchemaView(ctx.byName.get("completed")!);
+    expect(payloadSchemaIssues(ctx.byName.get("completed")!, { anything: 1 })).toEqual([]);
+  });
+
+  test("whitespace-only schema text is still an invalid schema, not empty", () => {
+    const ctx = ctxOf([{ name: "completed", schemaJson: "  " }]);
+    const view = ctx.byName.get("completed")!;
+    expect(view.schemaInvalid).toBe(true);
+    expect(payloadSchemaIssues(view, { anything: 1 })).toEqual([ISSUE_BAD_SCHEMA]);
+  });
+
+  test("empty-schema contract validates nothing end-to-end via evaluateContractSubmission", () => {
+    const ctx = ctxOf([{ name: "plain", schemaJson: "" }]);
+    expect(submit(ctx, "plain", { anything: [1, "two", null] })).toEqual([]);
+  });
+
+  test("empty-schema fallback contract finalizes any payload end-to-end", () => {
+    const ctx = ctxOf([{ name: "gave_up", fallback: true, schemaJson: new Uint8Array(0) }]);
+    expect(ctx.fallback?.name).toBe("gave_up");
+    expect(submit(ctx, "gave_up", { reason: "tests blocked by bad input" })).toEqual([]);
+  });
+
+  test("non-empty bytes that fail to parse are still flagged invalid (whitespace-only bytes)", () => {
+    const ctx = ctxOf([{ name: "completed", schemaJson: Buffer.from("  \n ") }]);
+    const view = ctx.byName.get("completed")!;
+    expect(view.schemaInvalid).toBe(true);
+    expect(submit(ctx, "completed", { anything: 1 })).toEqual([ISSUE_BAD_SCHEMA]);
+  });
+});
+
 describe("gate evaluation order", () => {
   const ctx = ctxOf([
     { name: "completed", schemaJson: SCHEMA },
