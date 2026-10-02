@@ -543,7 +543,7 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     expect(handlerResults[0].metadata.outcome).toBe("completed");
   });
 
-  test(`L: an empty-schema require_comment contract burns budget on missing_comment only and the fallback fires`, async () => {
+  test("L: an empty-schema require_comment contract burns budget on missing_comment only and the fallback fires", async () => {
     const helpers = startTurn({
       calls: [
         { outcome: "completed", payload: {} },
