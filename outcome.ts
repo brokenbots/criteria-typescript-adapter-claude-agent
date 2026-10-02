@@ -340,6 +340,7 @@ export function buildOutcomeMcpServer(options: BuildOutcomeServerOptions) {
           capture.finalized = true;
           capture.finalizedOutcome = outcome;
           capture.finalizedReason = reason;
+          capture.finalizedViaTool = true;
           capture.finalizeFailureKind = "";
 
           await helpers.log.adapterEvent("outcome.finalized", {
