@@ -490,7 +490,7 @@ export const REPAIR_ISSUES_MAX_CHARS = 2000;
  * "code + field path" form and truncated — never echoed freeform.
  * Lines outside the pinned vocabulary are kept truncated and tagged.
  */
-function formatIssueLine(line: string): string {
+function formatIssueLine(line: string): string | null {
   const trimmed = line.trim();
   if (trimmed === "") {
     return null;
@@ -643,6 +643,13 @@ export function buildContractRepromptPrompt(
     `You have not finalized this workflow step. Call the \`${SUBMIT_OUTCOME_TOOL_NAME}\` tool now with one of: ${list}. ` +
     `Use the args shape { outcome, comment?, payload? } with a nested payload matching the step's outcome contract.`
   );
+  if (contracts.length > 0) {
+    const summary = contracts
+      .slice(0, 8)
+      .map((view) => `- ${truncateText(buildContractLine(view), 240)}`)
+      .join("\n");
+    text += `\nContract summary:\n${summary}`;
+  }
   if (pendingIssues.length > 0) {
     const pending = truncateText(pendingIssues.join("; "), FALLBACK_REASON_ISSUES_MAX_CHARS);
     text += ` Your previous submission was rejected with these issues: ${pending}. Fix them before resubmitting.`;
@@ -668,6 +675,10 @@ export function buildRepairPrompt({ rejection, contracts }: RejectionPromptConte
   );
   if (rejection.outcome) {
     lines.push(`Attempted outcome: "${rejection.outcome}".`);
+    const contract = contracts.find((view) => view.name === rejection.outcome);
+    if (contract) {
+      lines.push(`Requirements for "${contract.name}": ${truncateText(buildContractLine(contract), 240)}`);
+    }
   }
   lines.push("Validation issues requiring correction:");
   lines.push(formatRejectionIssuesForPrompt(rejection.issues));
@@ -689,6 +700,10 @@ export function buildRejectionNote({ rejection, contracts }: RejectionPromptCont
     `NOTE: a previous execution of this step was rejected by the host (repair attempt ${rejection.attempt}).` +
       (rejection.outcome ? ` Attempted outcome: "${rejection.outcome}".` : "")
   );
+  const contract = contracts.find((view) => view.name === rejection.outcome);
+  if (contract) {
+    lines.push(`Requirements for "${contract.name}": ${truncateText(buildContractLine(contract), 240)}`);
+  }
   lines.push("Validation issues to address before finalizing:");
   lines.push(formatRejectionIssuesForPrompt(rejection.issues));
   lines.push(

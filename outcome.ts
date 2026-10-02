@@ -22,6 +22,15 @@ import {
   ToolCallTimeoutError,
 } from "@criteria/adapter-sdk";
 import type { Helpers } from "@criteria/adapter-sdk";
+import {
+  buildContractToolDescription,
+  ContractModeContext,
+  evaluateContractSubmission,
+  FinalizeResolution,
+  formatFallbackFinalizeReason,
+  formatNeverFinalizedFallbackReason,
+  truncateText,
+} from "./contract.js";
 
 export const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
 
@@ -51,7 +60,12 @@ export const MAX_FINALIZE_ATTEMPTS = 3;
 
 export const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
 
-export type FinalizeFailureKind = "missing" | "invalid_outcome" | "duplicate" | "no_outcomes";
+export type FinalizeFailureKind =
+  | "missing"
+  | "invalid_outcome"
+  | "duplicate"
+  | "no_outcomes"
+  | "payload_validation_failed";
 
 /**
  * Mutable per-execute state for outcome capture. The MCP tool handler writes
@@ -66,6 +80,20 @@ export interface OutcomeState {
   finalizeFailureKind: FinalizeFailureKind | "";
   timedOut: boolean;
   error: Error | null;
+  /**
+   * Contract mode: the host aborted the in-flight query because a finalize
+   * became terminal (valid submission, fallback, or exhausted budget); the
+   * resulting AgentAbortError is expected, not a query failure.
+   */
+  finalizeAborted: boolean;
+  /** Contract mode: the validated model payload, forwarded verbatim. */
+  submittedPayload: Record<string, unknown> | null;
+  /** Contract mode: true only for a model-submitted valid finalize (synthetic
+   * fallbacks finalize without it, so host-repair `recovered` stays honest). */
+  finalizedViaTool: boolean;
+  /** Contract mode: issue strings from the last payload rejection (drives the
+   * exhaustion diagnostics when no fallback is configured). */
+  finalizeFailureIssues: string[];
 }
 
 export interface BuildOutcomeServerOptions {
@@ -73,6 +101,10 @@ export interface BuildOutcomeServerOptions {
   capture: OutcomeState;
   heldSecrets: (string | undefined)[];
   helpers: Helpers;
+  /** Contract mode (v0.7.0): parsed outcome contracts for this execute; null keeps legacy behavior byte-identical. */
+  contracts?: ContractModeContext | null;
+  /** Contract mode: invoked when the in-flight query must be aborted because a finalize is terminal. */
+  onFinalize?: () => void;
 }
 
 /**
@@ -87,6 +119,10 @@ export function createOutcomeState(): OutcomeState {
     finalizeFailureKind: "",
     timedOut: false,
     error: null,
+    finalizeAborted: false,
+    submittedPayload: null,
+    finalizedViaTool: false,
+    finalizeFailureIssues: [],
   };
 }
 
@@ -233,8 +269,19 @@ function describeAdapterToolFailure(err: unknown): { text: string; code?: string
  * allowed-outcome validation, duplicate detection, and updates the shared
  * OutcomeState. Validation errors are returned as MCP tool errors so the model
  * can retry within the same turn.
+ *
+ * Contract mode (v0.7.0): payload/comment validation runs against the parsed
+ * outcome contracts, rejections emit `outcome.payload_invalid` and consume the
+ * finalize budget, a valid payload becomes terminal (aborting the in-flight
+ * query), and budget exhaustion takes the contract's fallback outcome. Static
+ * argument schemas stay strategically permissive on payload/comment so every
+ * contract rejection happens in this handler — that is where the events and
+ * the budget live; an over-strict static schema would bypass both.
  */
 export function buildOutcomeMcpServer(options: BuildOutcomeServerOptions) {
+  if (options.contracts) {
+    return buildContractOutcomeMcpServer(options);
+  }
   const { allowedOutcomes, capture, heldSecrets, helpers } = options;
 
   const outcomeSchema =
@@ -353,18 +400,180 @@ export function buildOutcomeMcpServer(options: BuildOutcomeServerOptions) {
   });
 }
 
+/**
+ * Contract-mode submit_outcome tool: the model finally sees an enforced
+ * parameter schema (nested payload + conditional comment) and every contract
+ * rejection is evaluated inside the handler, where it emits
+ * `outcome.payload_invalid` and consumes the finalize budget.
+ */
+function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
+  const { allowedOutcomes, capture, heldSecrets, helpers, contracts, onFinalize } = options;
+  if (!contracts) {
+    throw new Error("contract mode requires parsed contracts");
+  }
+
+  const outcomeSchema =
+    allowedOutcomes.length > 0
+      ? z
+          .enum(allowedOutcomes as [string, ...string[]])
+          .describe(`The outcome to submit. Must be one of: ${allowedOutcomes.join(", ")}`)
+      : z.string().describe("The outcome name to finalize.");
+
+  return createSdkMcpServer({
+    name: "criteria-workflow",
+    alwaysLoad: true,
+    tools: [
+      {
+        name: SUBMIT_OUTCOME_TOOL_NAME,
+        description: SUBMIT_OUTCOME_DESCRIPTION + buildContractToolDescription(contracts.contracts),
+        inputSchema: {
+          outcome: outcomeSchema,
+          comment: z
+            .string()
+            .optional()
+            .describe("Finalize comment; required (non-empty) when the chosen outcome's contract sets require_comment."),
+          payload: z
+            .unknown()
+            .optional()
+            .describe(
+              "Nested JSON object validated against the chosen outcome's contract schema. " +
+                "Never flattened into the tool arguments."
+            ),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false },
+        handler: async (args: any) => {
+          const outcome = (args.outcome?.trim() as string | undefined) || "";
+          const comment = ((args.comment ?? args.reason) as string | undefined)?.trim() || "";
+          const payload = args.payload as unknown;
+
+          // The attempt is consumed before validation: every rejected
+          // submission burns budget exactly once.
+          capture.finalizeAttempts++;
+
+          if (capture.finalized) {
+            capture.finalizeFailureKind = "duplicate";
+            return submitOutcomeError(
+              `Outcome already finalized as "${capture.finalizedOutcome}" in this turn; do not call submit_outcome again.`
+            );
+          }
+
+          const issues = evaluateContractSubmission(contracts, allowedOutcomes, {
+            outcome,
+            comment,
+            payload,
+          });
+
+          if (issues.length > 0) {
+            await helpers.log.adapterEvent("outcome.payload_invalid", {
+              outcome: outcome || null,
+              issues,
+            });
+
+            if (capture.finalizeAttempts >= MAX_FINALIZE_ATTEMPTS) {
+              if (contracts.fallback) {
+                const fallback = contracts.fallback;
+                capture.finalized = true;
+                capture.finalizedOutcome = fallback.name;
+                capture.finalizedReason = formatFallbackFinalizeReason(
+                  capture.finalizeAttempts,
+                  issues
+                );
+                capture.finalizedViaTool = false;
+                capture.finalizeFailureKind = "";
+                await helpers.log.adapterEvent("outcome.finalized", {
+                  outcome: fallback.name,
+                  reason: sanitizeReason(capture.finalizedReason, heldSecrets),
+                });
+                onFinalize?.();
+                return submitOutcomeSuccess(fallback.name, capture.finalizedReason, heldSecrets);
+              }
+              capture.finalizeFailureKind = "payload_validation_failed";
+              capture.finalizeFailureIssues = issues;
+              onFinalize?.();
+              return submitOutcomeError(
+                `Payload validation failed ${capture.finalizeAttempts} times; the budget for this step is exhausted. Stop calling submit_outcome. ` +
+                  issues.join(" ")
+              );
+            }
+
+            return submitOutcomeError(issues.join("\n"));
+          }
+
+          capture.finalized = true;
+          capture.finalizedOutcome = outcome;
+          capture.finalizedReason = comment;
+          capture.submittedPayload =
+            payload !== undefined && payload !== null && typeof payload === "object" && !Array.isArray(payload)
+              ? (payload as Record<string, unknown>)
+              : {};
+          capture.finalizedViaTool = true;
+          capture.finalizeFailureKind = "";
+
+          await helpers.log.adapterEvent("outcome.finalized", {
+            outcome,
+            reason: sanitizeReason(comment, heldSecrets),
+          });
+          // Terminal for the turn: stop the in-flight query now instead of
+          // letting it run to completion.
+          onFinalize?.();
+
+          return submitOutcomeSuccess(outcome, comment, heldSecrets);
+        },
+      },
+      {
+        name: ADAPTER_TOOL_TOOL_NAME,
+        description: ADAPTER_TOOL_DESCRIPTION,
+        inputSchema: {
+          target: z.string().describe("Full adapter.<type>.<name>.tools[.<tool>] target"),
+          args: z.record(z.string(), z.any()).optional(),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false },
+        handler: async (args: any) => {
+          const target = (args?.target ?? "").trim() as string;
+          const callArgs = args?.args as Record<string, unknown> | undefined;
+
+          if (!target) {
+            return adapterToolError(
+              "adapter_tool requires a target in the adapter.<type>.<name>.tools[.<tool>] form."
+            );
+          }
+          try {
+            const result = await helpers.tools.callAdapterTool({
+              target,
+              args: callArgs,
+            });
+            await helpers.log.adapterEvent("adapter_tool.call", {
+              target,
+              status: "ok",
+            });
+            return adapterToolSuccess(result.outcome, result.outputs);
+          } catch (err) {
+            const failure = describeAdapterToolFailure(err);
+            await helpers.log.adapterEvent("adapter_tool.call", {
+              target,
+              status: err instanceof ToolCallDeniedError ? "denied" : "error",
+              ...(failure.code ? { code: failure.code } : {}),
+            });
+            return adapterToolError(failure.text);
+          }
+        },
+      },
+    ],
+  });
+}
+
 export interface ResolveOutcomeOptions {
   state: OutcomeState;
   allowedOutcomes: string[];
   attempts: number;
   helpers: Helpers;
   heldSecrets: (string | undefined)[];
+  /** Contract mode (v0.7.0): parsed contracts; enables fallback finalization. */
+  contracts?: ContractModeContext | null;
 }
 
-export interface ResolvedOutcome {
-  outcome: string;
-  reason: string;
-}
+/** Terminal finalize resolution, including the contract-mode wire extras. */
+export type ResolvedOutcome = FinalizeResolution;
 
 /**
  * Resolve the terminal outcome from the capture state and emit the
@@ -375,14 +584,33 @@ export interface ResolvedOutcome {
  *   - a fallback outcome after exhausting reprompt attempts
  */
 export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<ResolvedOutcome> {
-  const { state, allowedOutcomes, attempts, helpers, heldSecrets } = options;
+  const { state, allowedOutcomes, attempts, helpers, heldSecrets, contracts } = options;
 
   // 1. Valid submitted outcome: already emitted outcome.finalized by the tool.
   if (state.finalized && state.finalizedOutcome) {
-    return {
+    const reason = sanitizeReason(state.finalizedReason, heldSecrets);
+    const resolution: ResolvedOutcome = {
       outcome: state.finalizedOutcome,
-      reason: sanitizeReason(state.finalizedReason, heldSecrets),
+      reason,
     };
+    if (contracts && state.finalizedViaTool) {
+      resolution.comment = reason;
+      resolution.payload = state.submittedPayload ?? {};
+    }
+    return resolution;
+  }
+
+  // 1b. Contract mode: the model never produced a usable submission, but the
+  // step's contracts declare a fallback outcome. Keep timeout/error semantics
+  // below intact; this branch only runs for a cleanly-ended turn.
+  if (contracts && contracts.fallback && !state.timedOut && !state.error) {
+    const fallback = contracts.fallback;
+    const reason = formatNeverFinalizedFallbackReason(attempts);
+    await helpers.log.adapterEvent("outcome.finalized", {
+      outcome: fallback.name,
+      reason: sanitizeReason(reason, heldSecrets),
+    });
+    return { outcome: fallback.name, reason };
   }
 
   // 2. Timeout before any valid outcome.
@@ -427,13 +655,21 @@ export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<Re
     invalid_outcome: "invalid outcome",
     duplicate: "duplicate finalize",
     no_outcomes: "step has no declared outcomes",
+    payload_validation_failed: "payload validation failed",
   };
   const reasonLabel = reasonLabels[kind] || "missing finalize";
   const allowedList = sortedAllowedOutcomes(allowedOutcomes);
-  const reason = sanitizeReason(
-    `Agent completed without submitting a valid outcome after ${attempts} finalize attempt(s) (${reasonLabel}).`,
-    heldSecrets
-  );
+  const baseReason = `Agent completed without submitting a valid outcome after ${attempts} finalize attempt(s) (${reasonLabel}).`;
+  // Contract mode carries the last validation issues so the outcome reason is
+  // actionable; legacy reasons stay byte-identical.
+  const reasonText =
+    kind === "payload_validation_failed" && state.finalizeFailureIssues.length > 0
+      ? `${baseReason} Last validation issues: ${truncateText(
+          state.finalizeFailureIssues.join("; "),
+          400
+        )}`
+      : baseReason;
+  const reason = sanitizeReason(reasonText, heldSecrets);
 
   await helpers.log.adapterEvent("outcome.failure", {
     reason,
