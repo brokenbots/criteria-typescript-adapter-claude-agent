@@ -49,6 +49,15 @@ import {
   buildRepromptPrompt,
   resolveOutcome,
 } from "./outcome.js";
+import {
+  buildContractModeContext,
+  buildContractOutcomeInstructions,
+  buildContractRepromptPrompt,
+  buildRepairPrompt,
+  buildRejectionNoteAppend,
+  extractExecutionRejection,
+  finalizeWireOptsFor,
+} from "./contract.js";
 
 // ============================================================================
 // Constants
@@ -455,7 +464,27 @@ async function runExecuteStep(
     : null;
 
   const allowedOutcomes = req.allowedOutcomes ?? [];
-  const outcomeInstructions = buildOutcomeInstructions(allowedOutcomes);
+  const contractCtx = buildContractModeContext(req);
+  const rejection = extractExecutionRejection(req);
+  const contractMode = contractCtx !== null;
+
+  // Host-rejection repair (v0.7.0): the prior execute's finalize was rejected
+  // by the engine. The same live claude session already owns the task, so a
+  // minimal repair prompt is sent into it instead of the full step prompt; a
+  // dead session degrades to a full re-execute with the rejection note attached.
+  let initialPrompt: string;
+  if (rejection) {
+    const note = claudeSessionId
+      ? buildRepairPrompt({ rejection, contracts: contractCtx?.contracts ?? [] })
+      : prompt + buildRejectionNoteAppend(rejection, contractCtx?.contracts ?? []);
+    initialPrompt = note;
+  } else {
+    initialPrompt = prompt;
+  }
+
+  const outcomeInstructions = contractMode
+    ? buildContractOutcomeInstructions(allowedOutcomes, contractCtx!.contracts)
+    : buildOutcomeInstructions(allowedOutcomes);
 
   // The outcome instructions are always appended: without them the agent never
   // learns that `submit_outcome` exists and the step can only fail.
@@ -473,8 +502,20 @@ async function runExecuteStep(
   const heldSecrets = [apiKey, authToken];
 
   const outcomeState = createOutcomeState();
-  const mcpServer = buildOutcomeMcpServer({ allowedOutcomes, capture: outcomeState, heldSecrets, helpers });
   const abortController = new AbortController();
+  const mcpServer = buildOutcomeMcpServer({
+    allowedOutcomes,
+    capture: outcomeState,
+    heldSecrets,
+    helpers,
+    contracts: contractCtx,
+    onFinalize: () => {
+      // A finalize just became terminal (valid submission, fallback, or an
+      // exhausted budget): the in-flight query must not run to completion.
+      outcomeState.finalizeAborted = true;
+      abortController.abort();
+    },
+  });
 
   // Configure a per-step timeout. Precedence: per-step input, session config,
   // then no timeout. A positive timeout aborts the query and forces a timeout
@@ -568,8 +609,9 @@ async function runExecuteStep(
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
       // A timeout abort is expected and already recorded on the state; other
-      // errors are terminal agent failures.
-      if (!outcomeState.timedOut) {
+      // errors are terminal agent failures. A finalize-initiated abort (the
+      // contract-mode turn is over) is likewise expected.
+      if (!outcomeState.timedOut && !outcomeState.finalizeAborted) {
         outcomeState.error = err;
       }
       await helpers.log.stderr(`[claude-agent] Query error: ${err.message}\n`);
@@ -584,19 +626,23 @@ async function runExecuteStep(
     }
   };
 
-  await runQuery(prompt, claudeSessionId || undefined);
+  await runQuery(initialPrompt, claudeSessionId || undefined);
 
   // The agent often answers and stops without finalizing. Re-prompt it in the
   // same session, resuming so it keeps the conversation context. We count the
   // initial query as attempt 1 and allow up to MAX_FINALIZE_ATTEMPTS total
   // attempts, matching the copilot adapter behavior (1 initial + 2 reprompts).
+  // Contract mode folds rejected submit_outcome calls into the same budget:
+  // once MAX attempts were consumed in-handler, reprompting cannot change the
+  // terminal result.
   let attempts = 1;
   while (
     !outcomeState.finalized &&
     !outcomeState.timedOut &&
     !outcomeState.error &&
-    allowedOutcomes.length > 0 &&
+    (contractMode || allowedOutcomes.length > 0) &&
     streamState.claudeSessionId &&
+    (!contractMode || outcomeState.finalizeAttempts < MAX_FINALIZE_ATTEMPTS) &&
     attempts < MAX_FINALIZE_ATTEMPTS
   ) {
     const nextAttempt = attempts + 1;
@@ -604,7 +650,16 @@ async function runExecuteStep(
       attempt: nextAttempt,
       maxAttempts: MAX_FINALIZE_ATTEMPTS,
     });
-    await runQuery(buildRepromptPrompt(allowedOutcomes), streamState.claudeSessionId);
+    await runQuery(
+      contractMode
+        ? buildContractRepromptPrompt(
+            allowedOutcomes,
+            contractCtx!.contracts,
+            outcomeState.finalizeFailureIssues
+          )
+        : buildRepromptPrompt(allowedOutcomes),
+      streamState.claudeSessionId
+    );
     attempts = nextAttempt;
   }
 
@@ -618,8 +673,23 @@ async function runExecuteStep(
     attempts,
     helpers,
     heldSecrets,
+    contracts: contractCtx,
   });
-  await helpers.outcomes.finalize(resolved.outcome, { reason: resolved.reason });
+
+  // Host-rejection repair succeeded: mark the corrected terminal finalize as
+  // recovered (the repair attempt produced a submission via the tool, not a
+  // synthetic fallback).
+  if (rejection && outcomeState.finalized && outcomeState.finalizedViaTool) {
+    await helpers.log.adapterEvent("outcome.recovered", {
+      attempt: rejection.attempt,
+      outcome: resolved.outcome,
+    });
+  }
+
+  await helpers.outcomes.finalize(
+    resolved.outcome,
+    finalizeWireOptsFor(resolved, contractMode)
+  );
 }
 
 // ============================================================================
