@@ -101,6 +101,58 @@ describe("buildStepSurface", () => {
     expect(payload.description).toContain(quoteJoin(["completed", "failed"]));
   });
 
+  test("KB-261: a non-required contract property stays optional on the payload branch (no model-visible required)", () => {
+    const loose = {
+      type: "object",
+      properties: { summary: { type: "string" }, notes: { type: "string" } },
+      required: ["summary"],
+    };
+    const c = ctx([{ name: "completed", schema_json: JSON.stringify(loose) }])!;
+    const surface = buildStepSurface(["completed"], c.contracts)!;
+    const rendered = renderSchema(surface);
+
+    // Declared names stay visible (unknown-typed, optional members).
+    const payload = rendered.properties.payload;
+    expect(payload.properties.summary).toBeDefined();
+    expect(payload.properties.notes).toBeDefined();
+    // zod 4's z.unknown() alone is non-optional and would list contract
+    // fields in `required`, rejecting contract-valid payloads at the MCP
+    // bridge before the handler runs — the branch must stay optional.
+    expect(payload.required).toBeUndefined();
+    expect(payload.required ?? []).not.toContain("notes");
+
+    // And the shape accepts a contract-valid payload missing the
+    // non-required field (decode still routes via the handler).
+    const result = z.object(surface.zodShape).safeParse({ outcome: "completed", payload: { summary: "s" } });
+    expect(result.success).toBe(true);
+  });
+
+  test("KB-261: diverging payload branches carry per-outcome descriptions on the model-visible anyOf", () => {
+    const other = {
+      type: "object",
+      properties: { error: { type: "string" } },
+      required: ["error"],
+    };
+    const c = ctx([
+      { name: "failed", schema_json: JSON.stringify(other) },
+      { name: "completed", schema_json: JSON.stringify(COMMITTED_SCHEMA) },
+    ])!;
+    const surface = buildStepSurface(["completed", "failed"], c.contracts)!;
+    const payload = renderSchema(surface).properties.payload;
+
+    // Assert on the MODEL-VISIBLE schema: every anyOf member names the
+    // outcome(s) it finalizes, so the model can map a branch to its verdict.
+    expect(payload.anyOf).toHaveLength(2);
+    for (const member of payload.anyOf) {
+      expect(member.description).toBeDefined();
+      expect(member.description).toContain("Use only when finalizing with outcome");
+    }
+    expect(payload.anyOf[0].description).toContain(quoteJoin(["completed"]));
+    expect(payload.anyOf[0].description).not.toContain(quoteJoin(["failed"]));
+    expect(payload.anyOf[1].description).toContain(quoteJoin(["failed"]));
+    expect(payload.anyOf[1].description).not.toContain(quoteJoin(["completed"]));
+  });
+
   test("mixed steps keep the reason parameter with schemaless-only wording", () => {
     const c = ctx([
       { name: "completed", schema_json: JSON.stringify(COMMITTED_SCHEMA) },

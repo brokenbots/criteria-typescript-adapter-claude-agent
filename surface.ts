@@ -17,9 +17,12 @@
  *    built byte-parity with the copilot surface;
  *  - the zod inputSchema handed to the agent SDK stays validation-permissive
  *    on payload members (KB-46 ruling: an over-strict static schema would
- *    bypass the handler where the events and the finalize budget live), and
- *    the SDK transport layer pre-emptively rejects undeclared keys and
- *    verdicts before the handler runs;
+ *    bypass the handler where the events and the finalize budget live) and
+ *    preserves undeclared keys (loose object), so unknown keys reach the
+ *    handler's surface-aware strict decode and are rejected typed with
+ *    finalize-budget accounting instead of being silently stripped by the
+ *    SDK transport; the enum lane is strict and the SDK transport layer
+ *    pre-emptively rejects invalid verdicts before the handler runs;
  *  - the handler-side strict decode remains the authoritative lane on the
  *    direct-call surface (mock harnesses call tool handlers directly).
  */
@@ -361,7 +364,7 @@ function stepSurfaceZodShape(
     shape.payload = looseObjectFromSchema(branches[0].schema).optional().describe(payloadDescription);
   } else {
     shape.payload = z
-      .union(branches.map((branch) => looseObjectFromSchema(branch.schema)))
+      .union(branches.map((branch) => looseObjectFromSchema(branch.schema).describe(payloadBranchDescription(branch.outcomes))))
       .optional()
       .describe(payloadDescription);
   }
@@ -373,17 +376,20 @@ function stepSurfaceZodShape(
 }
 
 /**
- * A permissive per-branch payload shape: the schema's declared property names
- * stay visible as unknown-typed optional fields, and unknown keys are
- * preserved (loose object). Field types are not enforced — the handler's
- * pinned evaluator is the enforcement point.
+ * A permissive per-branch payload shape: the schema's declared property
+ * names stay visible as unknown-typed OPTIONAL fields (zod 4's
+ * `z.unknown()` alone is non-optional and would render the fields into the
+ * model-visible `required` array, rejecting contract-valid payloads at the
+ * MCP bridge before the handler runs), and unknown keys are preserved
+ * (loose object). Field types are not enforced — the handler's pinned
+ * evaluator is the enforcement point.
  */
 function looseObjectFromSchema(schema: Record<string, unknown>): z.ZodTypeAny {
   const fields: Record<string, z.ZodTypeAny> = {};
   const props = schema.properties as Record<string, unknown> | undefined;
   if (props && typeof props === "object") {
     for (const key of Object.keys(props)) {
-      fields[key] = z.unknown();
+      fields[key] = z.unknown().optional();
     }
   }
   return z.looseObject(fields);
