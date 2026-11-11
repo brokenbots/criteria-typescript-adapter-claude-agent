@@ -7,7 +7,7 @@
     "build:linux-x64": "bun scripts/build.ts --target=bun-linux-x64",
     "build:linux-arm64": "bun scripts/build.ts --target=bun-linux-arm64",
     "build:darwin-arm64": "bun scripts/build.ts --target=bun-darwin-arm64",
-    "binary:install": "mkdir -p ${HOME}/.criteria/adapters \u0026\u0026 cp bin/criteria-adapter-claude-agent ${HOME}/.criteria/adapters/",
+    "binary:install": "mkdir -p ${HOME}/.criteria/adapters && cp bin/criteria-adapter-claude-agent ${HOME}/.criteria/adapters/",
     "test": "bun test",
     "clean": "rm -f bin/criteria-adapter-claude-agent",
     "vuln-scan": "osv-scanner scan source --config=osv-scanner.toml -r .",
@@ -16,7 +16,15 @@
   "dependencies": {
     "@criteria/adapter-sdk": "0.5.6",
     "@anthropic-ai/claude-agent-sdk": "^0.2.141",
-    "zod": "^4.5.2"
+    "zod": "^4.6.6",
+    "@hono/node-server": "^2.1.3",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "body-parser": "^2.4.0",
+    "fast-uri": "^3.1.9",
+    "ip-address": "^10.7.4",
+    "minimatch": "^11.0.1",
+    "proxy-addr": "^2.0.8",
+    "qs": "^6.16.1"
   },
   "trustedDependencies": [
     "protobufjs"
@@ -25,12 +33,17 @@
     "@criteria/adapter-sdk": "file:../criteria-typescript-adapter-sdk",
     "@grpc/grpc-js": "^1.14.4",
     "brace-expansion": "^5.0.9",
-    "fast-uri": "^3.1.5",
+    "fast-uri": "^3.1.9",
     "hono": "^4.12.34",
-    "ip-address": "^10.1.1",
+    "ip-address": "^10.7.4",
     "js-yaml": "^4.3.1",
-    "minimatch": "^10.2.6",
+    "minimatch": "^11.0.1",
     "protobufjs": "^7.6.3",
-    "qs": "^6.16.0"
+    "qs": "^6.16.1",
+    "@hono/node-server": "^2.1.3",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "body-parser": "^2.4.0",
+    "proxy-addr": "^2.0.8",
+    "zod": "^4.6.6"
   }
 }
