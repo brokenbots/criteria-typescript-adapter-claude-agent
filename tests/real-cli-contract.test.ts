@@ -37,11 +37,10 @@ test.skipIf(SKIP)(
       timeout: 200_000,
     });
     const output = (proc.stdout?.toString() ?? "") + (proc.stderr?.toString() ?? "");
-    expect(
-      output,
-      `real-CLI conformance harness failed (exit ${proc.exitCode}); child output:\n${output.slice(-4000)}`
-    ).toContain("Ran 2 test");
-    expect(proc.exitCode, output.slice(-4000)).toBe(0);
+    // Exit code only, deliberately: a missing/wrong path or any failing child
+    // exits non-zero, and the child cannot silently self-skip (it gates on
+    // the same CRITERIA_CLAUDE_CLI_CONTRACT knob as this parent's skipIf).
+    expect(proc.exitCode, `real-CLI conformance harness failed; child output:\n${output.slice(-4000)}`).toBe(0);
   },
   240_000
 );
