@@ -12,6 +12,12 @@
 
 import { z } from "zod";
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { REDACTED_PLACEHOLDER, sanitizeReason } from "./redaction.js";
+
+// The held-secret redaction primitives live in the shared redaction module
+// (contract.ts hashes redacted canonical payload renderings); re-exported so
+// consumers keep importing them from the outcome module.
+export { REDACTED_PLACEHOLDER, sanitizeReason };
 import {
   CALL_ERROR_HOST_UNSUPPORTED,
   CALL_ERROR_UNKNOWN_ADAPTER,
@@ -23,14 +29,23 @@ import {
 } from "@criteria/adapter-sdk";
 import type { Helpers } from "@criteria/adapter-sdk";
 import {
-  buildContractToolDescription,
+  contractSchemaCarrying,
   ContractModeContext,
   evaluateContractSubmission,
+  finalizedDisplayReason as resolveFinalizedDisplayReason,
   FinalizeResolution,
+  foldDeclaredPayloadParams,
   formatFallbackFinalizeReason,
   formatNeverFinalizedFallbackReason,
+  outcomeNotAllowedIssue,
   truncateText,
 } from "./contract.js";
+import {
+  decodeSubmitOutcomeArgs,
+  sdkMcpInputSchema,
+  StepSurface,
+  SubmitArgsDecodeError,
+} from "./surface.js";
 
 export const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
 
@@ -45,13 +60,6 @@ export const ADAPTER_TOOL_DESCRIPTION =
   'and correct the target after "unknown_tool".';
 
 /**
- * Placeholder used when a secret value the adapter holds appears in the
- * agent-authored `reason` text. The replacement is visible so readers can see
- * that something was removed, rather than silently dropping it.
- */
-export const REDACTED_PLACEHOLDER = "[REDACTED]";
-
-/**
  * Calling `submit_outcome` is model behaviour, not a guarantee — the agent
  * regularly answers a conversational prompt and stops. Re-prompt it this many
  * times before giving up and taking the fallback outcome.
@@ -60,9 +68,37 @@ export const MAX_FINALIZE_ATTEMPTS = 3;
 
 export const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current workflow step. Call this exactly once with one of the allowed outcomes when you are done with your task. The allowed outcomes are provided in the system context.`;
 
+/**
+ * KB-263 wrong-lane rejection (typed): a schema-carrying typed outcome does
+ * not consume a top-level `reason` parameter at all — the payload is the
+ * output, so the step's findings belong under the payload's declared fields.
+ */
+export const TYPED_REASON_NOT_CONSUMED_MESSAGE =
+  'submit_outcome rejected: "reason" is not consumed by this typed outcome (its contract declares a payload schema, so the payload is the output). ' +
+  "The step's findings belong under the payload's declared fields — the schema's reason field when the contract declares one. " +
+  'Call submit_outcome again without the "reason" parameter.';
+
+/**
+ * Normalize a submitted payload to the wire form: only plain JSON objects
+ * forward; degenerate shapes (null, arrays, scalars) collapse to an empty
+ * object (the pinned evaluator's object-decode lane already rejected them,
+ * so this is only reachable on the success path of a schema-less contract).
+ */
+function normalizedFinalizePayload(payload: unknown): Record<string, unknown> {
+  return payload !== undefined &&
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload)
+    ? (payload as Record<string, unknown>)
+    : {};
+}
+
 export type FinalizeFailureKind =
   | "missing"
   | "invalid_outcome"
+  | "invalid_params"
+  | "comment_missing"
+  | "invalid_payload"
   | "duplicate"
   | "no_outcomes"
   | "payload_validation_failed";
@@ -94,6 +130,12 @@ export interface OutcomeState {
   /** Contract mode: issue strings from the last payload rejection (drives the
    * exhaustion diagnostics when no fallback is configured). */
   finalizeFailureIssues: string[];
+  /**
+   * Outcome-event display reason (KB-263): the finalized event's reason prose.
+   * Empty default keeps legacy lanes byte-identical; contract mode resolves
+   * it from the submitted payload (schema reason, else a sha256 digest).
+   */
+  finalizedDisplayReason: string;
 }
 
 export interface BuildOutcomeServerOptions {
@@ -103,6 +145,8 @@ export interface BuildOutcomeServerOptions {
   helpers: Helpers;
   /** Contract mode (v0.7.0): parsed outcome contracts for this execute; null keeps legacy behavior byte-identical. */
   contracts?: ContractModeContext | null;
+  /** Contract mode: the per-step submit_outcome surface (KB-391); required when contracts are present. */
+  surface?: StepSurface | null;
   /** Contract mode: invoked when the in-flight query must be aborted because a finalize is terminal. */
   onFinalize?: () => void;
 }
@@ -123,33 +167,8 @@ export function createOutcomeState(): OutcomeState {
     submittedPayload: null,
     finalizedViaTool: false,
     finalizeFailureIssues: [],
+    finalizedDisplayReason: "",
   };
-}
-
-/**
- * Best-effort redaction of secret values the adapter actually holds.
- *
- * This only removes verbatim occurrences of secrets the adapter has received
- * (currently ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN). It does not do
- * general-purpose secret detection, PII scrubbing, or entropy heuristics,
- * because those produce false positives that corrupt legitimate agent prose.
- * An agent's explanation may still contain other repository or user content;
- * consumers must decide where to route it.
- */
-export function sanitizeReason(reason: string, secrets: (string | undefined)[]): string {
-  const toRedact = secrets
-    .filter((s): s is string => typeof s === "string" && s.length > 0)
-    // Longer secrets first so a shorter value cannot slice a longer one.
-    .sort((a, b) => b.length - a.length);
-
-  let sanitized = reason;
-  for (const value of toRedact) {
-    // Escape regex metacharacters so the secret is matched literally.
-    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = new RegExp(escaped, "g");
-    sanitized = sanitized.replace(pattern, REDACTED_PLACEHOLDER);
-  }
-  return sanitized;
 }
 
 /**
@@ -402,23 +421,54 @@ export function buildOutcomeMcpServer(options: BuildOutcomeServerOptions) {
 }
 
 /**
- * Contract-mode submit_outcome tool: the model finally sees an enforced
- * parameter schema (nested payload + conditional comment) and every contract
- * rejection is evaluated inside the handler, where it emits
- * `outcome.payload_invalid` and consumes the finalize budget.
+ * Contract-mode submit_outcome tool (KB-391 per-step surface parity): the
+ * model sees this step's delivered outcome contracts as schema metadata —
+ * the allowed-outcome enum plus per-outcome payload branches and
+ * conditional-reason/comment descriptions — and every contract rejection is
+ * evaluated inside the handler, where it emits `outcome.payload_invalid`
+ * and consumes the finalize budget. A surface-aware strict decode rejects
+ * undeclared parameters typed (invalid_outcome / invalid_params) before any
+ * budget-costing evaluation.
  */
 function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
-  const { allowedOutcomes, capture, heldSecrets, helpers, contracts, onFinalize } = options;
+  const { allowedOutcomes, capture, heldSecrets, helpers, contracts, onFinalize, surface } = options;
   if (!contracts) {
     throw new Error("contract mode requires parsed contracts");
   }
+  if (!surface) {
+    throw new Error("contract mode requires a step surface");
+  }
 
-  const outcomeSchema =
-    allowedOutcomes.length > 0
-      ? z
-          .enum(allowedOutcomes as [string, ...string[]])
-          .describe(`The outcome to submit. Must be one of: ${allowedOutcomes.join(", ")}`)
-      : z.string().describe("The outcome name to finalize.");
+  const allowedList = sortedAllowedOutcomes(allowedOutcomes);
+
+  // Classify evaluator issues into the typed KB-391 rejection kinds. The
+  // empty-outcome evaluator issue maps to invalid_outcome (an undeclared
+  // verdict), missing_comment to its own kind, and payload-schema issues to
+  // invalid_payload — matching the copilot adapter's typed classification.
+  function contractRejectionKind(issues: string[]): FinalizeFailureKind {
+    let commentOnly = true;
+    let payloadIssue = false;
+    for (const issue of issues) {
+      if (issue.startsWith("missing_comment: ")) {
+        continue;
+      }
+      commentOnly = false;
+      if (issue.startsWith("payload_schema: ")) {
+        payloadIssue = true;
+      }
+    }
+    if (commentOnly) {
+      return "comment_missing";
+    }
+    if (payloadIssue) {
+      return "invalid_payload";
+    }
+    return "invalid_outcome";
+  }
+
+  function isNotAllowedOnly(issues: string[], candidateOutcome: string): boolean {
+    return issues.length === 1 && issues[0] === outcomeNotAllowedIssue(candidateOutcome);
+  }
 
   return createSdkMcpServer({
     name: "criteria-workflow",
@@ -426,31 +476,36 @@ function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
     tools: [
       {
         name: SUBMIT_OUTCOME_TOOL_NAME,
-        description: SUBMIT_OUTCOME_DESCRIPTION + buildContractToolDescription(contracts.contracts),
-        inputSchema: {
-          outcome: outcomeSchema,
-          comment: z
-            .string()
-            .optional()
-            .describe("Finalize comment; required (non-empty) when the chosen outcome's contract sets require_comment."),
-          payload: z
-            .unknown()
-            .optional()
-            .describe(
-              "Nested JSON object validated against the chosen outcome's contract schema. " +
-                "Never flattened into the tool arguments."
-            ),
-        },
+        description: surface.description,
+        // KB-261: a loose ZodObject (not the raw shape — the SDK's raw-shape
+        // wrapping strips unknown keys, silently dropping an all-typed step's
+        // stray `reason` before the handler's strict decode could reject it),
+        // with the declared members exposed so the SDK's description
+        // migration keeps them on the wire schema.
+        inputSchema: sdkMcpInputSchema(surface.zodShape),
         annotations: { readOnlyHint: false, destructiveHint: false },
         handler: async (args: any) => {
-          const outcome = (args.outcome?.trim() as string | undefined) || "";
-          const comment = ((args.comment ?? args.reason) as string | undefined)?.trim() || "";
-          const payload = args.payload as unknown;
+          // Surface-aware strict decode (KB-391): unknown or malformed
+          // arguments are rejected typed before any budget-costing
+          // evaluation. The rejected call still consumes one finalize
+          // attempt, mirroring the copilot handler's budget ordering.
+          let decoded: Record<string, unknown>;
+          try {
+            decoded = decodeSubmitOutcomeArgs(args, surface);
+          } catch (err) {
+            capture.finalizeAttempts++;
+            const kind: FinalizeFailureKind = err instanceof SubmitArgsDecodeError ? err.kind : "invalid_outcome";
+            capture.finalizeFailureKind = kind;
+            return submitOutcomeError(err instanceof Error ? err.message : String(err));
+          }
 
-          // The attempt is consumed before validation: every rejected
-          // submission burns budget exactly once.
-          capture.finalizeAttempts++;
+          const outcome = (typeof decoded.outcome === "string" ? decoded.outcome : "").trim();
+          const comment = (typeof decoded.comment === "string" ? decoded.comment : "").trim();
+          const rawReason = typeof decoded.reason === "string" ? decoded.reason.trim() : "";
+          const payload = decoded.payload;
 
+          // Duplicate finalize: checked before the budget so duplicates never
+          // consume an attempt.
           if (capture.finalized) {
             capture.finalizeFailureKind = "duplicate";
             return submitOutcomeError(
@@ -458,10 +513,27 @@ function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
             );
           }
 
+          // Every evaluated submission burns budget exactly once.
+          capture.finalizeAttempts++;
+
+          const outcomeContract = contracts.byName.get(outcome) ?? null;
+          // KB-263/388: fold a top-level reason/comment into the payload when
+          // the chosen contract schema requires those members and the payload
+          // itself lacks them, in the contract's required order.
+          const folded = foldDeclaredPayloadParams(rawReason, comment, payload, outcomeContract);
+
+          // KB-263 wrong lane: a schema-carrying typed outcome does not
+          // consume a top-level reason parameter at all. A reason that the
+          // fold did not absorb is a wrong-lane submission, rejected typed.
+          if (rawReason !== "" && !folded.reasonFolded && outcomeContract && contractSchemaCarrying(outcomeContract)) {
+            capture.finalizeFailureKind = "invalid_params";
+            return submitOutcomeError(TYPED_REASON_NOT_CONSUMED_MESSAGE);
+          }
+
           const issues = evaluateContractSubmission(contracts, allowedOutcomes, {
             outcome,
             comment,
-            payload,
+            payload: folded.payload,
           });
 
           if (issues.length > 0) {
@@ -488,7 +560,7 @@ function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
                 onFinalize?.();
                 return submitOutcomeSuccess(fallback.name, capture.finalizedReason, heldSecrets);
               }
-              capture.finalizeFailureKind = "payload_validation_failed";
+              capture.finalizeFailureKind = contractRejectionKind(issues);
               capture.finalizeFailureIssues = issues;
               onFinalize?.();
               return submitOutcomeError(
@@ -497,22 +569,39 @@ function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
               );
             }
 
+            // Typed rejection wording (KB-391): an undeclared verdict gets
+            // the not-allowed chooser listing this step's allowed outcomes;
+            // the remaining lanes keep the evaluator's structured issues as
+            // the model-facing message.
+            if (isNotAllowedOnly(issues, outcome)) {
+              capture.finalizeFailureKind = "invalid_outcome";
+              return submitOutcomeError(
+                `Outcome "${outcome}" is not in the allowed set; choose one of: ${allowedList.join(", ")}`
+              );
+            }
+            capture.finalizeFailureKind = contractRejectionKind(issues);
             return submitOutcomeError(issues.join("\n"));
           }
 
           capture.finalized = true;
           capture.finalizedOutcome = outcome;
           capture.finalizedReason = comment;
-          capture.submittedPayload =
-            payload !== undefined && payload !== null && typeof payload === "object" && !Array.isArray(payload)
-              ? (payload as Record<string, unknown>)
-              : {};
+          capture.submittedPayload = normalizedFinalizePayload(folded.payload);
           capture.finalizedViaTool = true;
           capture.finalizeFailureKind = "";
+          // Event display reason (KB-263): typed outcomes render the payload's
+          // operative prose (or a payload digest); schema-less contracts keep
+          // the reason-or-comment render.
+          capture.finalizedDisplayReason = resolveFinalizedDisplayReason(
+            outcomeContract,
+            rawReason || comment,
+            capture.submittedPayload,
+            heldSecrets
+          );
 
           await helpers.log.adapterEvent("outcome.finalized", {
             outcome,
-            reason: sanitizeReason(comment, heldSecrets),
+            reason: sanitizeReason(capture.finalizedDisplayReason, heldSecrets),
           });
           // Terminal for the turn: stop the in-flight query now instead of
           // letting it run to completion.
@@ -589,13 +678,20 @@ export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<Re
 
   // 1. Valid submitted outcome: already emitted outcome.finalized by the tool.
   if (state.finalized && state.finalizedOutcome) {
-    const reason = sanitizeReason(state.finalizedReason, heldSecrets);
+    // KB-263: the event/verdict reason lane renders the operative prose —
+    // the typed payload's display reason when the handler resolved one,
+    // else the finalize reason (unchanged for legacy lanes and fallbacks).
+    const display = state.finalizedDisplayReason !== "" ? state.finalizedDisplayReason : state.finalizedReason;
+    const reason = sanitizeReason(display, heldSecrets);
     const resolution: ResolvedOutcome = {
       outcome: state.finalizedOutcome,
       reason,
     };
     if (contracts && state.finalizedViaTool) {
-      resolution.comment = reason;
+      // Contract-mode wire parity (contractResultEvent): the schema-validated
+      // payload is forwarded verbatim and the comment rides the comment lane.
+      // The comment lane stays the wire comment (sanitize once, here).
+      resolution.comment = sanitizeReason(state.finalizedReason, heldSecrets);
       resolution.payload = state.submittedPayload ?? {};
     }
     return resolution;
@@ -654,6 +750,12 @@ export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<Re
   const reasonLabels: Record<FinalizeFailureKind, string> = {
     missing: "missing finalize",
     invalid_outcome: "invalid outcome",
+    invalid_params: "invalid parameters",
+    comment_missing: "comment missing",
+    // "payload validation failed" is the pinned exhaustion diagnosis for a
+    // typed payload-schema rejection (test C); the label spells the same
+    // finding the evaluator reported.
+    invalid_payload: "payload validation failed",
     duplicate: "duplicate finalize",
     no_outcomes: "step has no declared outcomes",
     payload_validation_failed: "payload validation failed",
@@ -664,7 +766,8 @@ export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<Re
   // Contract mode carries the last validation issues so the outcome reason is
   // actionable; legacy reasons stay byte-identical.
   const reasonText =
-    kind === "payload_validation_failed" && state.finalizeFailureIssues.length > 0
+    (kind === "payload_validation_failed" || kind === "invalid_payload") &&
+    state.finalizeFailureIssues.length > 0
       ? `${baseReason} Last validation issues: ${truncateText(
           state.finalizeFailureIssues.join("; "),
           400

@@ -9,9 +9,17 @@
  * host-rejection repair prompts, and the no-contract passthrough.
  */
 import { describe, test, expect, mock } from "bun:test";
+import { createHash } from "node:crypto";
+import { z } from "zod";
 import { FAKE_CLI, adapterPath } from "./helpers.js";
 import { missingCommentIssue, SUBMIT_OUTCOME_TOOL_NAME } from "../contract.js";
-import { MAX_FINALIZE_ATTEMPTS } from "../outcome.js";
+import { MAX_FINALIZE_ATTEMPTS, REDACTED_PLACEHOLDER } from "../outcome.js";
+import { canonicalJson, sanitizeReason } from "../redaction.js";
+
+/** The KB-263 typed display reason: a sha256 digest of the redacted canonical payload rendering (with no held secrets, redaction is identity). */
+function digestOf(value: unknown): string {
+  return "sha256:" + createHash("sha256").update(sanitizeReason(canonicalJson(value), [])).digest("hex");
+}
 
 // ---------------------------------------------------------------------------
 // Fake claude SDK
@@ -121,7 +129,7 @@ const execute = mod.adapterConfig.execute as (req: any, helpers: any) => Promise
 // Harness
 // ---------------------------------------------------------------------------
 
-function makeHelpers(): any {
+function makeHelpers(heldSecrets?: { apiKey?: string; authToken?: string }): any {
   const sessionStore = new Map<string, any>();
   const events: Array<{ kind: string; payload: any }> = [];
   const finalizeCalls: Array<{ outcome: string; opts: any }> = [];
@@ -131,7 +139,13 @@ function makeHelpers(): any {
       get: (key: string) => sessionStore.get(key),
       set: (key: string, value: any) => void sessionStore.set(key, value),
     },
-    secrets: { get: async () => null },
+    secrets: {
+      get: async (name: string) => {
+        if (name === "ANTHROPIC_API_KEY") return heldSecrets?.apiKey ?? null;
+        if (name === "ANTHROPIC_AUTH_TOKEN") return heldSecrets?.authToken ?? null;
+        return null;
+      },
+    },
     log: {
       adapterEvent: async (kind: string, payload: any) => {
         events.push({ kind, payload });
@@ -159,11 +173,11 @@ function makeHelpers(): any {
   };
 }
 
-function startTurn(s: Script): any {
+function startTurn(s: Script, heldSecrets?: { apiKey?: string; authToken?: string }): any {
   script = s;
   captured.length = 0;
   handlerResults.length = 0;
-  const helpers = makeHelpers();
+  const helpers = makeHelpers(heldSecrets);
   helpers.session.set("claudeExecutable", FAKE_CLI);
   return helpers;
 }
@@ -222,12 +236,56 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     ]);
 
     expect(eventsOf(helpers, "outcome.finalized")).toEqual([
-      { outcome: "completed", reason: "Fixed the flake." },
+      { outcome: "completed", reason: digestOf(payload) },
     ]);
     expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
     expect(eventsOf(helpers, "outcome.recovered")).toEqual([]);
     expect(handlerResults[0].isError).toBeFalsy();
     expect(handlerResults[0].metadata.outcome).toBe("completed");
+  });
+
+  test("A2: the payload digest is a hash of the secret-REDACTED canonical rendering (KB-261)", async () => {
+    const apiKey = "sk-ant-api03-SECRET-VALUE-123456";
+    const payload = { summary: `used key ${apiKey} locally`, commit: "abc123" };
+    const helpers = startTurn(
+      { calls: [{ outcome: "completed", comment: "Fixed.", payload }], hang: true, sessionId: "sess-a2" },
+      { apiKey }
+    );
+    await execute(contractReq({}, "sess-a2"), helpers);
+
+    const events = eventsOf(helpers, "outcome.finalized");
+    expect(events).toHaveLength(1);
+    const reason = events[0].reason as string;
+    // The digest is computed over the redacted canonical payload, so it
+    // matches the same payload with the secret replaced by the placeholder —
+    // and differs from a digest of the raw secret-bearing payload (which
+    // would make the display lane a fingerprint of secret material).
+    const redactedPayload = { summary: `used key ${REDACTED_PLACEHOLDER} locally`, commit: "abc123" };
+    expect(reason).toBe(digestOf(redactedPayload));
+    expect(reason).not.toBe(digestOf(payload));
+    // The payload still travels on the finalize lane verbatim (redaction is
+    // the digest input's concern, not the result lane's).
+    expect(helpers.finalizeCalls[0].opts.payload).toEqual(payload);
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+  });
+
+  test("A3: payload key order does not change the digest (canonical, key-sorted rendering)", async () => {
+    const first = startTurn({
+      calls: [{ outcome: "completed", comment: "done", payload: { summary: "s", commit: "abc" } }],
+      hang: true,
+      sessionId: "sess-a3-a",
+    });
+    await execute(contractReq({}, "sess-a3-a"), first);
+
+    const second = startTurn({
+      calls: [{ outcome: "completed", comment: "done", payload: { commit: "abc", summary: "s" } }],
+      hang: true,
+      sessionId: "sess-a3-b",
+    });
+    await execute(contractReq({}, "sess-a3-b"), second);
+
+    expect(eventsOf(first, "outcome.finalized")[0].reason).toBe(eventsOf(second, "outcome.finalized")[0].reason);
+    expect(eventsOf(first, "outcome.finalized")[0].reason).toBe(digestOf({ summary: "s", commit: "abc" }));
   });
 
   test("B: rejected payloads loop in-turn and the contract fallback fires at budget exhaustion", async () => {
@@ -337,7 +395,7 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
       },
     ]);
     expect(eventsOf(helpers, "outcome.finalized")).toEqual([
-      { outcome: "completed", reason: "done now" },
+      { outcome: "completed", reason: digestOf({ summary: "ok", commit: "abc" }) },
     ]);
     expect(helpers.finalizeCalls).toEqual([
       { outcome: "completed", opts: { comment: "done now", payload: { summary: "ok", commit: "abc" } } },
@@ -499,10 +557,22 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     );
     await execute(req, helpers);
 
-    expect(captured[0].tool.inputSchema.payload).toBeDefined();
-    expect(captured[0].tool.inputSchema.comment).toBeDefined();
-    expect(captured[0].tool.inputSchema.outcome).toBeDefined();
-    expect(captured[0].tool.description).toContain("NESTED JSON object");
+    // KB-391: the description is the per-step surface render (not the old
+    // contract-liner appendix), COMMITTED_SCHEMA declares no reason member so
+    // the declared set carries no reason parameter, and the allowed-outcome
+    // enum rides the schema metadata the model sees. The inputSchema is a
+    // loose ZodObject instance (not a raw shape), so undeclared top-level
+    // keys survive the SDK transport to the handler's strict decode and no
+    // longer render as required-only members — the rendered JSON schema is
+    // the model-visible artifact.
+    expect(captured[0].tool.description).toContain("the payload IS the step's output");
+    const rendered = z.toJSONSchema(captured[0].tool.inputSchema, { io: "input" });
+    expect(rendered.properties.outcome.enum).toEqual(["completed"]);
+    expect(rendered.properties.comment).toBeDefined();
+    expect(rendered.properties.payload).toBeDefined();
+    expect(rendered.properties.reason).toBeUndefined();
+    // Loose-object mapping: undeclared keys are not stripped at the bridge.
+    expect(rendered.additionalProperties).toBeDefined();
     expect(helpers.finalizeCalls).toEqual([
       { outcome: "completed", opts: { comment: "c", payload: { summary: "s", commit: "c" } } },
     ]);
@@ -583,5 +653,287 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     );
     expect(helpers.finalizeCalls[0].opts.reason).toContain("requires a comment");
     expect(helpers.finalizeCalls[0].opts.reason).not.toContain("not a valid schema");
+  });
+
+  // -----------------------------------------------------------------------
+  // KB-391/396 surface re-bind parity
+  // -----------------------------------------------------------------------
+
+  test("N: consecutive steps with different contracts re-bind the surface per step while the same-id session resumes", async () => {
+    // Step 1: typed contracts; the execute persists its claude session id and
+    // the bound surface digest on the shared chain.
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", comment: "c1", payload: { summary: "s", commit: "c" } }],
+      sessionId: "sess-n",
+    });
+    await execute(contractReq({}, "sess-n"), helpers);
+    expect(helpers.session.get("claudeSessionId")).toBe("sess-n");
+
+    // Step 2 on the SAME live session, with a different delivered contract
+    // set (schema-less) — the KB-396 shape: a surface change must not destroy
+    // the resumed conversation.
+    const firstResume = captured[0].resume;
+    const firstSchema = captured[0].tool.inputSchema;
+    const firstDescription = captured[0].tool.description;
+    script = {
+      calls: [{ outcome: "needs_human", reason: "human review needed" }],
+      sessionId: "sess-n",
+    };
+    captured.length = 0;
+    handlerResults.length = 0;
+    (helpers as any).finalizeCalls.length = 0;
+    const finalizedBeforeStep2 = eventsOf(helpers, "outcome.finalized");
+    await execute(
+      contractReq({ allowedOutcomes: ["needs_human"], outcomeContracts: [{ name: "needs_human", fallback: true }] }, "sess-n"),
+      helpers
+    );
+
+    // SAME-ID resume: step 2 resumed step 1's reported claude session id.
+    expect(firstResume).toBeUndefined();
+    expect(captured[0].resume).toBe("sess-n");
+    // The re-bind event carries the guard signal (sameId).
+    expect(eventsOf(helpers, "outcome.surface_rebind")).toEqual([
+      { resumeId: null, sameId: false },
+      { resumeId: "sess-n", sameId: true },
+    ]);
+
+    // Per-step surface: step 2's own contract set, unioned enum, reason
+    // member back (schema-less step), generic payload lane. Both schemas are
+    // zod instances (loose ZodObject), rendered directly.
+    const first = z.toJSONSchema(firstSchema, { io: "input" });
+    expect(first.properties.outcome.enum).toEqual(["completed", "failed", "gave_up"]);
+    const second = z.toJSONSchema(captured[0].tool.inputSchema, { io: "input" });
+    expect(second.properties.outcome.enum).toEqual(["needs_human"]);
+    expect(second.properties.reason).toBeDefined();
+    expect(second.properties.payload.description).toBe(
+      "Optional JSON object payload, forwarded to the workflow verbatim."
+    );
+    // A genuinely different per-step surface than step 1's.
+    expect(captured[0].tool.description).not.toBe(firstDescription);
+
+    // The schemaless finalize forwards the payload verbatim ({} — nothing
+    // submitted) plus the comment lane, per contract-mode wire parity.
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "needs_human", opts: { comment: "", payload: {} } },
+    ]);
+    expect(eventsOf(helpers, "outcome.finalized")).toEqual(
+      finalizedBeforeStep2.concat([{ outcome: "needs_human", reason: "human review needed" }])
+    );
+  });
+
+  test("O: consecutive steps with an identical surface cost no re-bind", async () => {
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", comment: "c1", payload: { summary: "s", commit: "c" } }],
+      sessionId: "sess-o",
+    });
+    await execute(contractReq({}, "sess-o"), helpers);
+    const bindsAfterStep1 = eventsOf(helpers, "outcome.surface_rebind");
+    expect(bindsAfterStep1).toHaveLength(1); // entering contract mode
+
+    script = {
+      calls: [{ outcome: "failed", comment: "c2", payload: { summary: "still broken" } }],
+      sessionId: "sess-o",
+    };
+    captured.length = 0;
+    handlerResults.length = 0;
+    await execute(contractReq({}, "sess-o"), helpers);
+
+    // Same delivered contracts → same digest → no re-bind event on step 2,
+    // and the same-id resume still continues the chain.
+    expect(eventsOf(helpers, "outcome.surface_rebind")).toEqual(bindsAfterStep1);
+    expect(captured[1].resume).toBe("sess-o");
+  });
+
+  test("P: an undeclared verdict is rejected typed (invalid_outcome) with the allowed-set chooser", async () => {
+    const helpers = startTurn({
+      calls: [
+        { outcome: "bogus_outcome", comment: "try one", payload: { summary: "s", commit: "c" } },
+        { outcome: "bogus_outcome", comment: "try two", payload: { summary: "s", commit: "c" } },
+        { outcome: "bogus_outcome", comment: "try three", payload: { summary: "s", commit: "c" } },
+      ],
+      sessionId: "sess-p",
+    });
+    await execute(
+      contractReq({ outcomeContracts: [{ name: "completed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) }] }, "sess-p"),
+      helpers
+    );
+
+    // Typed model-facing rejection: the allowed-set chooser, not the raw
+    // evaluator issue string.
+    expect(handlerResults[0].isError).toBe(true);
+    expect(handlerResults[0].content[0].text).toBe(
+      'Outcome "bogus_outcome" is not in the allowed set; choose one of: completed, failed'
+    );
+
+    // The budget-costing event keeps the pinned evaluator issue.
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual(
+      Array.from({ length: MAX_FINALIZE_ATTEMPTS }, () => ({
+        outcome: "bogus_outcome",
+        issues: ['outcome_not_allowed: outcome "bogus_outcome" is not in allowed_outcomes'],
+      }))
+    );
+
+    // Exhaustion carries the typed classification in the failure reason.
+    expect(helpers.finalizeCalls[0].opts.reason).toContain("(invalid outcome)");
+  });
+
+  test("Q1: a top-level reason folds into a contract-schema-required reason member (mixed-step reason preservation)", async () => {
+    const REASON_SCHEMA = {
+      type: "object",
+      properties: {
+        summary: { type: "string" },
+        commit: { type: "string" },
+        reason: { type: "string" },
+      },
+      required: ["summary", "commit", "reason"],
+    };
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", reason: "the flake was a race", payload: { summary: "s", commit: "c" } }],
+      hang: true,
+      sessionId: "sess-q1",
+    });
+    // Mixed step: the schemaless gave_up keeps the top-level reason lane
+    // declared, which is exactly the lane the fold reconciles for the typed
+    // outcome's contract-required reason member.
+    await execute(
+      contractReq(
+        {
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.from(JSON.stringify(REASON_SCHEMA)) },
+            { name: "gave_up", fallback: true },
+          ],
+        },
+        "sess-q1"
+      ),
+      helpers
+    );
+
+    // The fold moved the top-level reason into the payload (contract-required
+    // order) so the evaluator's required-member gate passes.
+    expect(helpers.finalizeCalls).toEqual([
+      {
+        outcome: "completed",
+        opts: {
+          comment: "",
+          payload: { summary: "s", commit: "c", reason: "the flake was a race" },
+        },
+      },
+    ]);
+    // Display lane: the folded reason prose is the operative output text.
+    expect(eventsOf(helpers, "outcome.finalized")).toEqual([
+      { outcome: "completed", reason: "the flake was a race" },
+    ]);
+  });
+
+  test("Q2: a top-level reason on a typed outcome without a schema reason member is rejected typed (invalid_params)", async () => {
+    const helpers = startTurn({
+      calls: [
+        { outcome: "completed", reason: "findings as prose", payload: { summary: "s", commit: "c" } },
+        { outcome: "completed", comment: "fixed", payload: { summary: "s2", commit: "c2" } },
+      ],
+      sessionId: "sess-q2",
+    });
+    await execute(contractReq({}, "sess-q2"), helpers);
+
+    expect(handlerResults[0].isError).toBe(true);
+    expect(handlerResults[0].content[0].text).toContain(
+      'submit_outcome rejected: "reason" is not consumed by this typed outcome (its contract declares a payload schema, so the payload is the output).'
+    );
+    expect(handlerResults[0].content[0].text).toContain(
+      "The step's findings belong under the payload's declared fields — the schema's reason field when the contract declares one. Call submit_outcome again without the \"reason\" parameter."
+    );
+
+    // One budget attempt burned by the wrong-lane rejection; the retry (without
+    // reason) finalizes.
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "completed", opts: { comment: "fixed", payload: { summary: "s2", commit: "c2" } } },
+    ]);
+  });
+
+  test("Q3: an all-typed step rejects a stray top-level reason via the surface-aware strict decode (KB-261 loose inputSchema)", async () => {
+    const helpers = startTurn({
+      calls: [
+        // reason is NOT a declared parameter on an all-typed step: the
+        // z.looseObject inputSchema preserves it to the handler, whose strict
+        // decode rejects it typed before any budget-costing evaluation.
+        { outcome: "completed", comment: "c", payload: { summary: "s", commit: "c" }, reason: "stray prose" },
+        { outcome: "completed", comment: "fixed", payload: { summary: "s2", commit: "c2" } },
+      ],
+      sessionId: "sess-q3",
+    });
+    await execute(
+      contractReq(
+        {
+          allowedOutcomes: ["completed", "failed"],
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) },
+            { name: "failed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) },
+          ],
+        },
+        "sess-q3"
+      ),
+      helpers
+    );
+
+    expect(handlerResults[0].isError).toBe(true);
+    expect(handlerResults[0].content[0].text).toContain(
+      'submit_outcome rejected: unknown parameter(s) "reason"'
+    );
+    expect(handlerResults[0].content[0].text).toContain(
+      'the declared parameters are "comment", "outcome", "payload"'
+    );
+
+    // The decode rejection burned one budget attempt but emitted no
+    // payload_invalid event; the retry finalized normally with the payload
+    // verbatim (the reason was not silently dropped into the finalized
+    // payload).
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "completed", opts: { comment: "fixed", payload: { summary: "s2", commit: "c2" } } },
+    ]);
+  });
+
+  test("Q4: a payload omitting a declared-but-not-required property finalizes at the handler (KB-261 optional payload lane)", async () => {
+    // Own fixture: `notes` is declared but NOT required. Every committed
+    // contract-mode fixture so far listed all declared properties in
+    // `required`, which is why the zod 4 z.unknown() non-optionality defect
+    // (bare z.unknown() rendered declared fields into the model-visible
+    // `required` array and rejected contract-valid payloads at the MCP
+    // bridge, before the handler) was invisible at this level.
+    const OPTIONAL_PROPERTY_SCHEMA = {
+      type: "object",
+      properties: { summary: { type: "string" }, notes: { type: "string" } },
+      required: ["summary"],
+    };
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", comment: "c", payload: { summary: "s" } }],
+      sessionId: "sess-q4",
+    });
+    await execute(
+      contractReq(
+        {
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.from(JSON.stringify(OPTIONAL_PROPERTY_SCHEMA)) },
+            { name: "failed", schema_json: Buffer.from(JSON.stringify(OPTIONAL_PROPERTY_SCHEMA)) },
+            { name: "gave_up", fallback: true },
+          ],
+        },
+        "sess-q4"
+      ),
+      helpers
+    );
+
+    // The contract-valid payload (missing the optional `notes`) reached the
+    // handler and finalized there — no bridge-level rejection, no
+    // payload_invalid event, no burned budget.
+    expect(handlerResults[0].isError).toBeFalsy();
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+    expect(eventsOf(helpers, "outcome.finalized")).toEqual([
+      { outcome: "completed", reason: digestOf({ summary: "s" }) },
+    ]);
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "completed", opts: { comment: "c", payload: { summary: "s" } } },
+    ]);
   });
 });
