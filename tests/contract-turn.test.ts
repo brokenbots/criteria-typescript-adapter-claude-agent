@@ -598,4 +598,199 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     expect(helpers.finalizeCalls[0].opts.reason).toContain("requires a comment");
     expect(helpers.finalizeCalls[0].opts.reason).not.toContain("not a valid schema");
   });
+
+  // -----------------------------------------------------------------------
+  // KB-391/396 surface re-bind parity
+  // -----------------------------------------------------------------------
+
+  test("N: consecutive steps with different contracts re-bind the surface per step while the same-id session resumes", async () => {
+    // Step 1: typed contracts; the execute persists its claude session id and
+    // the bound surface digest on the shared chain.
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", comment: "c1", payload: { summary: "s", commit: "c" } }],
+      sessionId: "sess-n",
+    });
+    await execute(contractReq({}, "sess-n"), helpers);
+    expect(helpers.session.get("claudeSessionId")).toBe("sess-n");
+
+    // Step 2 on the SAME live session, with a different delivered contract
+    // set (schema-less) — the KB-396 shape: a surface change must not destroy
+    // the resumed conversation.
+    const firstResume = captured[0].resume;
+    const firstSchema = { ...captured[0].tool.inputSchema };
+    const firstDescription = captured[0].tool.description;
+    script = {
+      calls: [{ outcome: "needs_human", reason: "human review needed" }],
+      sessionId: "sess-n",
+    };
+    captured.length = 0;
+    handlerResults.length = 0;
+    (helpers as any).finalizeCalls.length = 0;
+    const finalizedBeforeStep2 = eventsOf(helpers, "outcome.finalized");
+    await execute(
+      contractReq({ allowedOutcomes: ["needs_human"], outcomeContracts: [{ name: "needs_human", fallback: true }] }, "sess-n"),
+      helpers
+    );
+
+    // SAME-ID resume: step 2 resumed step 1's reported claude session id.
+    expect(firstResume).toBeUndefined();
+    expect(captured[0].resume).toBe("sess-n");
+    // The re-bind event carries the guard signal (sameId).
+    expect(eventsOf(helpers, "outcome.surface_rebind")).toEqual([
+      { resumeId: null, sameId: false },
+      { resumeId: "sess-n", sameId: true },
+    ]);
+
+    // Per-step surface: step 2's own contract set, unioned enum, reason
+    // member back (schema-less step), generic payload lane.
+    const first = z.toJSONSchema(z.object(firstSchema), { io: "input" });
+    expect(first.properties.outcome.enum).toEqual(["completed", "failed", "gave_up"]);
+    const second = z.toJSONSchema(z.object(captured[0].tool.inputSchema), { io: "input" });
+    expect(second.properties.outcome.enum).toEqual(["needs_human"]);
+    expect(second.properties.reason).toBeDefined();
+    expect(second.properties.payload.description).toBe(
+      "Optional JSON object payload, forwarded to the workflow verbatim."
+    );
+    // A genuinely different per-step surface than step 1's.
+    expect(captured[0].tool.description).not.toBe(firstDescription);
+
+    // The schemaless finalize forwards the payload verbatim ({} — nothing
+    // submitted) plus the comment lane, per contract-mode wire parity.
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "needs_human", opts: { comment: "", payload: {} } },
+    ]);
+    expect(eventsOf(helpers, "outcome.finalized")).toEqual(
+      finalizedBeforeStep2.concat([{ outcome: "needs_human", reason: "human review needed" }])
+    );
+  });
+
+  test("O: consecutive steps with an identical surface cost no re-bind", async () => {
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", comment: "c1", payload: { summary: "s", commit: "c" } }],
+      sessionId: "sess-o",
+    });
+    await execute(contractReq({}, "sess-o"), helpers);
+    const bindsAfterStep1 = eventsOf(helpers, "outcome.surface_rebind");
+    expect(bindsAfterStep1).toHaveLength(1); // entering contract mode
+
+    script = {
+      calls: [{ outcome: "failed", comment: "c2", payload: { summary: "still broken" } }],
+      sessionId: "sess-o",
+    };
+    captured.length = 0;
+    handlerResults.length = 0;
+    await execute(contractReq({}, "sess-o"), helpers);
+
+    // Same delivered contracts → same digest → no re-bind event on step 2,
+    // and the same-id resume still continues the chain.
+    expect(eventsOf(helpers, "outcome.surface_rebind")).toEqual(bindsAfterStep1);
+    expect(captured[1].resume).toBe("sess-o");
+  });
+
+  test("P: an undeclared verdict is rejected typed (invalid_outcome) with the allowed-set chooser", async () => {
+    const helpers = startTurn({
+      calls: [
+        { outcome: "bogus_outcome", comment: "try one", payload: { summary: "s", commit: "c" } },
+        { outcome: "bogus_outcome", comment: "try two", payload: { summary: "s", commit: "c" } },
+        { outcome: "bogus_outcome", comment: "try three", payload: { summary: "s", commit: "c" } },
+      ],
+      sessionId: "sess-p",
+    });
+    await execute(
+      contractReq({ outcomeContracts: [{ name: "completed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) }] }, "sess-p"),
+      helpers
+    );
+
+    // Typed model-facing rejection: the allowed-set chooser, not the raw
+    // evaluator issue string.
+    expect(handlerResults[0].isError).toBe(true);
+    expect(handlerResults[0].content[0].text).toBe(
+      'Outcome "bogus_outcome" is not in the allowed set; choose one of: completed, failed'
+    );
+
+    // The budget-costing event keeps the pinned evaluator issue.
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual(
+      Array.from({ length: MAX_FINALIZE_ATTEMPTS }, () => ({
+        outcome: "bogus_outcome",
+        issues: ['outcome_not_allowed: outcome "bogus_outcome" is not in allowed_outcomes'],
+      }))
+    );
+
+    // Exhaustion carries the typed classification in the failure reason.
+    expect(helpers.finalizeCalls[0].opts.reason).toContain("(invalid outcome)");
+  });
+
+  test("Q1: a top-level reason folds into a contract-schema-required reason member (mixed-step reason preservation)", async () => {
+    const REASON_SCHEMA = {
+      type: "object",
+      properties: {
+        summary: { type: "string" },
+        commit: { type: "string" },
+        reason: { type: "string" },
+      },
+      required: ["summary", "commit", "reason"],
+    };
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", reason: "the flake was a race", payload: { summary: "s", commit: "c" } }],
+      hang: true,
+      sessionId: "sess-q1",
+    });
+    // Mixed step: the schemaless gave_up keeps the top-level reason lane
+    // declared, which is exactly the lane the fold reconciles for the typed
+    // outcome's contract-required reason member.
+    await execute(
+      contractReq(
+        {
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.from(JSON.stringify(REASON_SCHEMA)) },
+            { name: "gave_up", fallback: true },
+          ],
+        },
+        "sess-q1"
+      ),
+      helpers
+    );
+
+    // The fold moved the top-level reason into the payload (contract-required
+    // order) so the evaluator's required-member gate passes.
+    expect(helpers.finalizeCalls).toEqual([
+      {
+        outcome: "completed",
+        opts: {
+          comment: "",
+          payload: { summary: "s", commit: "c", reason: "the flake was a race" },
+        },
+      },
+    ]);
+    // Display lane: the folded reason prose is the operative output text.
+    expect(eventsOf(helpers, "outcome.finalized")).toEqual([
+      { outcome: "completed", reason: "the flake was a race" },
+    ]);
+  });
+
+  test("Q2: a top-level reason on a typed outcome without a schema reason member is rejected typed (invalid_params)", async () => {
+    const helpers = startTurn({
+      calls: [
+        { outcome: "completed", reason: "findings as prose", payload: { summary: "s", commit: "c" } },
+        { outcome: "completed", comment: "fixed", payload: { summary: "s2", commit: "c2" } },
+      ],
+      sessionId: "sess-q2",
+    });
+    await execute(contractReq({}, "sess-q2"), helpers);
+
+    expect(handlerResults[0].isError).toBe(true);
+    expect(handlerResults[0].content[0].text).toContain(
+      'submit_outcome rejected: "reason" is not consumed by this typed outcome (its contract declares a payload schema, so the payload is the output).'
+    );
+    expect(handlerResults[0].content[0].text).toContain(
+      "The step's findings belong under the payload's declared fields — the schema's reason field when the contract declares one. Call submit_outcome again without the \"reason\" parameter."
+    );
+
+    // One budget attempt burned by the wrong-lane rejection; the retry (without
+    // reason) finalizes.
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "completed", opts: { comment: "fixed", payload: { summary: "s2", commit: "c2" } } },
+    ]);
+  });
 });

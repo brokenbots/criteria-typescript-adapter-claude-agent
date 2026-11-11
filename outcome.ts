@@ -581,7 +581,7 @@ function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
                 onFinalize?.();
                 return submitOutcomeSuccess(fallback.name, capture.finalizedReason, heldSecrets);
               }
-              capture.finalizeFailureKind = "payload_validation_failed";
+              capture.finalizeFailureKind = contractRejectionKind(issues);
               capture.finalizeFailureIssues = issues;
               onFinalize?.();
               return submitOutcomeError(
@@ -708,6 +708,8 @@ export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<Re
       reason,
     };
     if (contracts && state.finalizedViaTool) {
+      // Contract-mode wire parity (contractResultEvent): the schema-validated
+      // payload is forwarded verbatim and the comment rides the comment lane.
       // The comment lane stays the wire comment (sanitize once, here).
       resolution.comment = sanitizeReason(state.finalizedReason, heldSecrets);
       resolution.payload = state.submittedPayload ?? {};
@@ -770,7 +772,10 @@ export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<Re
     invalid_outcome: "invalid outcome",
     invalid_params: "invalid parameters",
     comment_missing: "comment missing",
-    invalid_payload: "invalid payload",
+    // "payload validation failed" is the pinned exhaustion diagnosis for a
+    // typed payload-schema rejection (test C); the label spells the same
+    // finding the evaluator reported.
+    invalid_payload: "payload validation failed",
     duplicate: "duplicate finalize",
     no_outcomes: "step has no declared outcomes",
     payload_validation_failed: "payload validation failed",
@@ -781,7 +786,8 @@ export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<Re
   // Contract mode carries the last validation issues so the outcome reason is
   // actionable; legacy reasons stay byte-identical.
   const reasonText =
-    kind === "payload_validation_failed" && state.finalizeFailureIssues.length > 0
+    (kind === "payload_validation_failed" || kind === "invalid_payload") &&
+    state.finalizeFailureIssues.length > 0
       ? `${baseReason} Last validation issues: ${truncateText(
           state.finalizeFailureIssues.join("; "),
           400
