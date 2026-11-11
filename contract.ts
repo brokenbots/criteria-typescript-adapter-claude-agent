@@ -25,6 +25,8 @@
  * the SDK lands.
  */
 
+import { createHash } from "node:crypto";
+
 // ============================================================================
 // Pinned issue-string vocabulary (conformance/README.md, v0.7.0)
 // ============================================================================
@@ -222,6 +224,11 @@ export function parseOutcomeSchemaText(schemaText: string | null): PayloadContra
   }
 
   return { required, properties };
+}
+
+/** True when the contract carries a payload schema (valid or not). */
+export function contractSchemaCarrying(view: OutcomeContractView): boolean {
+  return view.schemaText !== null || view.schemaInvalid;
 }
 
 /**
@@ -496,6 +503,98 @@ export function formatNeverFinalizedFallbackReason(attempts: number): string {
 }
 
 // ============================================================================
+// Typed-lane parameter reconciliation + display lane (KB-263/388 parity)
+// ============================================================================
+
+
+/**
+ * Fold a submitted top-level reason/comment into the payload when the chosen
+ * outcome's contract schema requires those members and the payload lacks
+ * them, in the schema's required order (the same reconcile the host performs
+ * at the verdict funnel). Returns the payload unchanged when nothing folded.
+ *
+ * `reasonFolded` is specifically whether the fold consumed the top-level
+ * REASON — the signal that gates the KB-263 wrong-lane rejection: a fold that
+ * consumed only the comment still leaves the top-level reason unconsumed.
+ * Only plain-object payloads fold; degenerate shapes (null, arrays, scalars)
+ * pass through untouched and the pinned evaluator's object-decode lane
+ * rejects them.
+ */
+export function foldDeclaredPayloadParams(
+  reason: string,
+  comment: string,
+  payload: unknown,
+  view: OutcomeContractView | null
+): { payload: unknown; reasonFolded: boolean } {
+  if (!view || view.parsed === null || view.parsed.required.length === 0) {
+    return { payload, reasonFolded: false };
+  }
+  if (payload === null || payload === undefined || typeof payload !== "object" || Array.isArray(payload)) {
+    return { payload, reasonFolded: false };
+  }
+  const object = payload as Record<string, unknown>;
+  let folded = false;
+  let reasonFolded = false;
+  for (const name of view.parsed.required) {
+    if (Object.prototype.hasOwnProperty.call(object, name)) {
+      continue;
+    }
+    if (name === "reason" && reason !== "") {
+      object[name] = reason;
+      folded = true;
+      reasonFolded = true;
+    } else if (name === "comment" && comment !== "") {
+      object[name] = comment;
+      folded = true;
+    }
+  }
+  return { payload: folded ? { ...object } : payload, reasonFolded };
+}
+
+/**
+ * Resolve the reason field of the outcome.finalized adapter event (KB-263).
+ * Untyped outcomes keep the agent-facing render: the top-level reason, or
+ * the finalize comment when no reason prose was submitted. Typed outcomes
+ * (a schema-carrying contract matched) render the operative prose from the
+ * validated payload — the schema's reason field when present — falling back
+ * to a digest of the payload, so the display lane is never empty on typed
+ * steps merely because the top-level parameter was absent.
+ */
+export function finalizedDisplayReason(
+  view: OutcomeContractView | null,
+  legacyReason: string,
+  payload: Record<string, unknown>
+): string {
+  if (!view || !contractSchemaCarrying(view)) {
+    return legacyReason;
+  }
+  return typedFinalizedDisplayReason(view, payload);
+}
+
+/** Whether the contract schema declares a top-level "reason" property. */
+function schemaDeclaresReason(view: OutcomeContractView): boolean {
+  return view.parsed?.properties["reason"] !== undefined;
+}
+
+/**
+ * Display prose for a typed finalize: the payload's "reason" property when
+ * the contract schema declares one and the payload carries non-empty prose,
+ * else a sha256 digest of the payload (the full typed output travels on the
+ * result lane, so the display lane stays cheap and non-empty).
+ */
+function typedFinalizedDisplayReason(view: OutcomeContractView, payload: Record<string, unknown>): string {
+  if (schemaDeclaresReason(view)) {
+    const prose = payload.reason;
+    if (typeof prose === "string" && prose !== "") {
+      return prose;
+    }
+  }
+  const sum = createHash("sha256");
+  sum.update(JSON.stringify(payload));
+  return "sha256:" + sum.digest("hex");
+}
+
+// ============================================================================
 // Structured issue echo + repair prompts
 // ============================================================================
 
@@ -606,19 +705,6 @@ export function buildContractLine(view: OutcomeContractView): string {
   }
   const prefix = `"${view.name}"`;
   return bits.length > 0 ? `${prefix}: ${bits.join("; ")}` : prefix;
-}
-
-/**
- * Contract guidance appended to the submit_outcome tool description.
- */
-export function buildContractToolDescription(contracts: OutcomeContractView[]): string {
-  const lines = contracts.slice(0, 24).map((view) => `  - ${truncateText(buildContractLine(view), 240)}`);
-  const suffix = contracts.length > 24 ? `\n  - … (${contracts.length - 24} more):` : "";
-  return (
-    "\n\nOutcome contracts: when choosing an outcome, submit its payload as a NESTED JSON object " +
-    "(never flattened into the tool arguments) and match the contract below:\n" +
-    lines.join("\n") + suffix
-  );
 }
 
 /**

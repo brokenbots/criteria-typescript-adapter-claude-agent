@@ -58,6 +58,7 @@ import {
   extractExecutionRejection,
   finalizeWireOptsFor,
 } from "./contract.js";
+import { buildStepSurface, ensureStepSurface } from "./surface.js";
 
 // ============================================================================
 // Constants
@@ -468,6 +469,29 @@ async function runExecuteStep(
   const rejection = extractExecutionRejection(req);
   const contractMode = contractCtx !== null;
 
+  // KB-391: re-bind the submit_outcome tool surface per execute from this
+  // step's delivered outcome contracts. Outside contract mode the surface is
+  // null and the static lane keeps its byte-identical schema. The guard keeps
+  // the persisted claude CLI session id usable across surface-changing steps
+  // (KB-396): a re-bind must never force a fresh conversation on a resumed
+  // same-id live session.
+  const wantSurface = contractMode ? buildStepSurface(allowedOutcomes, contractCtx!.contracts) : null;
+  const surfaceDecision = ensureStepSurface({
+    want: wantSurface,
+    boundDigest: helpers.session.get<string>("claudeSubmitSurfaceDigest") ?? "",
+    persistedResumeId: claudeSessionId,
+    sharesResumeChain,
+  });
+  if (surfaceDecision.rebind) {
+    await helpers.log.adapterEvent("outcome.surface_rebind", {
+      resumeId: surfaceDecision.resumeId,
+      sameId: surfaceDecision.resumeId !== null && surfaceDecision.resumeId === claudeSessionId,
+    });
+  }
+  if (sharesResumeChain) {
+    helpers.session.set("claudeSubmitSurfaceDigest", surfaceDecision.boundDigest);
+  }
+
   // Host-rejection repair (v0.7.0): the prior execute's finalize was rejected
   // by the engine. The same live claude session already owns the task, so a
   // minimal repair prompt is sent into it instead of the full step prompt; a
@@ -509,6 +533,7 @@ async function runExecuteStep(
     heldSecrets,
     helpers,
     contracts: contractCtx,
+    surface: wantSurface,
     onFinalize: () => {
       // A finalize just became terminal (valid submission, fallback, or an
       // exhausted budget): the in-flight query must not run to completion.
@@ -626,7 +651,7 @@ async function runExecuteStep(
     }
   };
 
-  await runQuery(initialPrompt, claudeSessionId || undefined);
+  await runQuery(initialPrompt, surfaceDecision.resumeId ?? undefined);
 
   // The agent often answers and stops without finalizing. Re-prompt it in the
   // same session, resuming so it keeps the conversation context. We count the

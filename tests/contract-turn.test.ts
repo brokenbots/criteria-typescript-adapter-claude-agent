@@ -9,9 +9,16 @@
  * host-rejection repair prompts, and the no-contract passthrough.
  */
 import { describe, test, expect, mock } from "bun:test";
+import { createHash } from "node:crypto";
+import { z } from "zod";
 import { FAKE_CLI, adapterPath } from "./helpers.js";
 import { missingCommentIssue, SUBMIT_OUTCOME_TOOL_NAME } from "../contract.js";
 import { MAX_FINALIZE_ATTEMPTS } from "../outcome.js";
+
+/** The KB-263 typed display reason: a sha256 digest of the submitted payload. */
+function digestOf(value: unknown): string {
+  return "sha256:" + createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
 
 // ---------------------------------------------------------------------------
 // Fake claude SDK
@@ -222,7 +229,7 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     ]);
 
     expect(eventsOf(helpers, "outcome.finalized")).toEqual([
-      { outcome: "completed", reason: "Fixed the flake." },
+      { outcome: "completed", reason: digestOf(payload) },
     ]);
     expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
     expect(eventsOf(helpers, "outcome.recovered")).toEqual([]);
@@ -337,7 +344,7 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
       },
     ]);
     expect(eventsOf(helpers, "outcome.finalized")).toEqual([
-      { outcome: "completed", reason: "done now" },
+      { outcome: "completed", reason: digestOf({ summary: "ok", commit: "abc" }) },
     ]);
     expect(helpers.finalizeCalls).toEqual([
       { outcome: "completed", opts: { comment: "done now", payload: { summary: "ok", commit: "abc" } } },
@@ -502,7 +509,14 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     expect(captured[0].tool.inputSchema.payload).toBeDefined();
     expect(captured[0].tool.inputSchema.comment).toBeDefined();
     expect(captured[0].tool.inputSchema.outcome).toBeDefined();
-    expect(captured[0].tool.description).toContain("NESTED JSON object");
+    // KB-391: the description is the per-step surface render (not the old
+    // contract-liner appendix), COMMITTED_SCHEMA declares no reason member so
+    // the declared set carries no reason parameter, and the allowed-outcome
+    // enum rides the schema metadata the model sees.
+    expect(captured[0].tool.description).toContain("the payload IS the step's output");
+    expect(captured[0].tool.inputSchema.reason).toBeUndefined();
+    const rendered = z.toJSONSchema(z.object(captured[0].tool.inputSchema), { io: "input" });
+    expect(rendered.properties.outcome.enum).toEqual(["completed"]);
     expect(helpers.finalizeCalls).toEqual([
       { outcome: "completed", opts: { comment: "c", payload: { summary: "s", commit: "c" } } },
     ]);
