@@ -21,6 +21,17 @@
  *  - an undeclared verdict is rejected typed (invalid_outcome) over the real
  *    tools/call wire.
  *
+ * This file deliberately does NOT match the default `bun test` glob (no
+ * `.test.` in the filename): Bun's test runner shares one process — and one
+ * module registry — across test files, so any sibling file that calls
+ * `mock.module("@anthropic-ai/claude-agent-sdk")` would leak into this suite
+ * and silently replace the SDK the harness must exercise (fake query objects
+ * resolve without ever spawning the CLI). `tests/real-cli-contract.test.ts`
+ * runs this file as a child process so it always sees the real SDK; it can
+ * also be run directly for iteration:
+ *
+ *   bun test ./tests/real-cli-surface.standalone.ts
+ *
  * The fake CLI is version-coupled to the installed agent-SDK control protocol;
  * set CRITERIA_CLAUDE_CLI_CONTRACT=0 to skip the suite (CI triage knob).
  */
