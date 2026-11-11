@@ -376,6 +376,58 @@ function stepSurfaceZodShape(
 }
 
 /**
+ * The input schema registered for the SDK MCP `submit_outcome` tool. The raw
+ * shape is wrapped in `z.looseObject` (KB-261): the agent SDK wraps a raw
+ * shape with `z4mini.object(...)`, whose default semantics strip unknown
+ * keys — on an all-typed step a submitted `reason` would be silently dropped
+ * before the handler's surface-aware strict decode sees it. A loose
+ * ZodObject preserves unknown keys so the strict decode rejects them typed
+ * with finalize-budget accounting.
+ *
+ * The agent SDK also copies only the descriptions of
+ * `Object.values(inputSchema)` members into the private zod registry its
+ * bundled JSON-Schema converter reads. `Object.values` of a zod-object
+ * instance yields no schema nodes (the members live inside `_zod.def.shape`),
+ * so registering the bare instance loses every description on the wire. The
+ * declared members — and a diverging-schema payload union's per-outcome
+ * branch members — are therefore exposed as enumerable instance properties
+ * so that migration loop finds them. Parse and render semantics are
+ * untouched: zod reads `_zod.def.shape`, not instance properties.
+ */
+export function sdkMcpInputSchema(shape: z.ZodRawShape) {
+  const instance = z.looseObject(shape);
+  const isDescribedSchemaNode = (node: unknown): boolean =>
+    typeof node === "object" &&
+    node !== null &&
+    "_zod" in node &&
+    typeof (node as { description?: unknown }).description === "string";
+  for (const key of Object.keys(shape)) {
+    Object.defineProperty(instance, key, {
+      value: shape[key],
+      enumerable: true,
+      configurable: true,
+      writable: false,
+    });
+  }
+  // Multi-branch payload: the per-outcome branch descriptions sit on the
+  // union's option nodes, one `.optional()` wrapper below the member node.
+  const def = (shape.payload as { _zod?: { def?: { innerType?: unknown; options?: unknown[] } } })?._zod?.def;
+  const unionDef = Array.isArray(def?.options)
+    ? def
+    : (def?.innerType as { _zod?: { def?: { options?: unknown[] } } } | undefined)?._zod?.def;
+  for (const [index, node] of (unionDef?.options ?? []).entries()) {
+    if (!isDescribedSchemaNode(node)) continue;
+    Object.defineProperty(instance, `payloadBranch${index}`, {
+      value: node,
+      enumerable: true,
+      configurable: true,
+      writable: false,
+    });
+  }
+  return instance;
+}
+
+/**
  * A permissive per-branch payload shape: the schema's declared property
  * names stay visible as unknown-typed OPTIONAL fields (zod 4's
  * `z.unknown()` alone is non-optional and would render the fields into the

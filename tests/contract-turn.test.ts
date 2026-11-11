@@ -557,17 +557,22 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     );
     await execute(req, helpers);
 
-    expect(captured[0].tool.inputSchema.payload).toBeDefined();
-    expect(captured[0].tool.inputSchema.comment).toBeDefined();
-    expect(captured[0].tool.inputSchema.outcome).toBeDefined();
     // KB-391: the description is the per-step surface render (not the old
     // contract-liner appendix), COMMITTED_SCHEMA declares no reason member so
     // the declared set carries no reason parameter, and the allowed-outcome
-    // enum rides the schema metadata the model sees.
+    // enum rides the schema metadata the model sees. The inputSchema is a
+    // loose ZodObject instance (not a raw shape), so undeclared top-level
+    // keys survive the SDK transport to the handler's strict decode and no
+    // longer render as required-only members — the rendered JSON schema is
+    // the model-visible artifact.
     expect(captured[0].tool.description).toContain("the payload IS the step's output");
-    expect(captured[0].tool.inputSchema.reason).toBeUndefined();
-    const rendered = z.toJSONSchema(z.object(captured[0].tool.inputSchema), { io: "input" });
+    const rendered = z.toJSONSchema(captured[0].tool.inputSchema, { io: "input" });
     expect(rendered.properties.outcome.enum).toEqual(["completed"]);
+    expect(rendered.properties.comment).toBeDefined();
+    expect(rendered.properties.payload).toBeDefined();
+    expect(rendered.properties.reason).toBeUndefined();
+    // Loose-object mapping: undeclared keys are not stripped at the bridge.
+    expect(rendered.additionalProperties).toBeDefined();
     expect(helpers.finalizeCalls).toEqual([
       { outcome: "completed", opts: { comment: "c", payload: { summary: "s", commit: "c" } } },
     ]);
@@ -668,7 +673,7 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     // set (schema-less) — the KB-396 shape: a surface change must not destroy
     // the resumed conversation.
     const firstResume = captured[0].resume;
-    const firstSchema = { ...captured[0].tool.inputSchema };
+    const firstSchema = captured[0].tool.inputSchema;
     const firstDescription = captured[0].tool.description;
     script = {
       calls: [{ outcome: "needs_human", reason: "human review needed" }],
@@ -693,10 +698,11 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     ]);
 
     // Per-step surface: step 2's own contract set, unioned enum, reason
-    // member back (schema-less step), generic payload lane.
-    const first = z.toJSONSchema(z.object(firstSchema), { io: "input" });
+    // member back (schema-less step), generic payload lane. Both schemas are
+    // zod instances (loose ZodObject), rendered directly.
+    const first = z.toJSONSchema(firstSchema, { io: "input" });
     expect(first.properties.outcome.enum).toEqual(["completed", "failed", "gave_up"]);
-    const second = z.toJSONSchema(z.object(captured[0].tool.inputSchema), { io: "input" });
+    const second = z.toJSONSchema(captured[0].tool.inputSchema, { io: "input" });
     expect(second.properties.outcome.enum).toEqual(["needs_human"]);
     expect(second.properties.reason).toBeDefined();
     expect(second.properties.payload.description).toBe(
@@ -839,6 +845,49 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
 
     // One budget attempt burned by the wrong-lane rejection; the retry (without
     // reason) finalizes.
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "completed", opts: { comment: "fixed", payload: { summary: "s2", commit: "c2" } } },
+    ]);
+  });
+
+  test("Q3: an all-typed step rejects a stray top-level reason via the surface-aware strict decode (KB-261 loose inputSchema)", async () => {
+    const helpers = startTurn({
+      calls: [
+        // reason is NOT a declared parameter on an all-typed step: the
+        // z.looseObject inputSchema preserves it to the handler, whose strict
+        // decode rejects it typed before any budget-costing evaluation.
+        { outcome: "completed", comment: "c", payload: { summary: "s", commit: "c" }, reason: "stray prose" },
+        { outcome: "completed", comment: "fixed", payload: { summary: "s2", commit: "c2" } },
+      ],
+      sessionId: "sess-q3",
+    });
+    await execute(
+      contractReq(
+        {
+          allowedOutcomes: ["completed", "failed"],
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) },
+            { name: "failed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) },
+          ],
+        },
+        "sess-q3"
+      ),
+      helpers
+    );
+
+    expect(handlerResults[0].isError).toBe(true);
+    expect(handlerResults[0].content[0].text).toContain(
+      'submit_outcome rejected: unknown parameter(s) "reason"'
+    );
+    expect(handlerResults[0].content[0].text).toContain(
+      'the declared parameters are "comment", "outcome", "payload"'
+    );
+
+    // The decode rejection burned one budget attempt but emitted no
+    // payload_invalid event; the retry finalized normally with the payload
+    // verbatim (the reason was not silently dropped into the finalized
+    // payload).
     expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
     expect(helpers.finalizeCalls).toEqual([
       { outcome: "completed", opts: { comment: "fixed", payload: { summary: "s2", commit: "c2" } } },

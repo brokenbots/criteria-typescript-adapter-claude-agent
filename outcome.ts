@@ -42,6 +42,7 @@ import {
 } from "./contract.js";
 import {
   decodeSubmitOutcomeArgs,
+  sdkMcpInputSchema,
   StepSurface,
   SubmitArgsDecodeError,
 } from "./surface.js";
@@ -476,7 +477,12 @@ function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
       {
         name: SUBMIT_OUTCOME_TOOL_NAME,
         description: surface.description,
-        inputSchema: surface.zodShape,
+        // KB-261: a loose ZodObject (not the raw shape — the SDK's raw-shape
+        // wrapping strips unknown keys, silently dropping an all-typed step's
+        // stray `reason` before the handler's strict decode could reject it),
+        // with the declared members exposed so the SDK's description
+        // migration keeps them on the wire schema.
+        inputSchema: sdkMcpInputSchema(surface.zodShape),
         annotations: { readOnlyHint: false, destructiveHint: false },
         handler: async (args: any) => {
           // Surface-aware strict decode (KB-391): unknown or malformed

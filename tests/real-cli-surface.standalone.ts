@@ -268,8 +268,11 @@ describe("real CLI surface conformance (KB-391/396)", () => {
         JSON.stringify({ outcome: "needs_human", reason: "not allowed this step" }) + "\n"
       );
       // Attempt 2: a declared outcome with a payload violating the step's
-      // payload_schema (missing commit). The embedded contract schema rejects
-      // it typed at the tool surface, naming the undeclared member.
+      // payload_schema (missing commit). The zod pre-decode is
+      // validation-permissive on the payload lane (KB-46): the call reaches
+      // the handler and the pinned contract evaluator rejects it typed,
+      // naming the missing member (one finalize attempt is consumed there,
+      // where the events and the budget live).
       appendFileSync(
         path.join(workdir, "fake-cli-script.jsonl"),
         JSON.stringify({ outcome: "completed", comment: "partial", payload: { summary: "s" } }) + "\n"
@@ -298,8 +301,7 @@ describe("real CLI surface conformance (KB-391/396)", () => {
 
       expect(calls[1].isError).toBe(true);
       const schemaViolated = (calls[1].content ?? []).map((block: any) => block?.text ?? "").join("");
-      expect(schemaViolated).toContain("Invalid arguments for tool submit_outcome");
-      expect(schemaViolated).toContain("commit");
+      expect(schemaViolated).toContain('payload_schema: property "commit": required property is missing');
 
       expect(calls[2].isError).toBe(true);
       const wrongLane = (calls[2].content ?? []).map((block: any) => block?.text ?? "").join("");
@@ -313,6 +315,73 @@ describe("real CLI surface conformance (KB-391/396)", () => {
       expect(spawns[1].resume).toBe(spawns[0].sessionId);
       expect(helpers.finalizeCalls).toHaveLength(1);
       expect(helpers.finalizeCalls[0].outcome).toBe("gave_up");
+    },
+    120_000
+  );
+
+  test.skipIf(SKIP)(
+    "all-typed step rejects a stray top-level reason typed with finalize-budget accounting (KB-261)",
+    async () => {
+      const workdir = mkdtempSync(path.join(os.tmpdir(), "claude-real-cli-typed-"));
+      const helpers = makeHelpers();
+      helpers.session.set("claudeExecutable", buildFakeCli(workdir));
+
+      // Every attempt submits a contract-valid typed shape that carries a
+      // stray extra top-level `reason` parameter. On an all-typed step
+      // `reason` is not a declared member, so each call must be rejected
+      // typed by the handler's surface-aware strict decode (invalid_params,
+      // one finalize attempt per call) — and must NOT reach finalize with
+      // the findings text dropped.
+      for (let i = 0; i < 3; i++) {
+        appendFileSync(
+          path.join(workdir, "fake-cli-script.jsonl"),
+          JSON.stringify({ outcome: "completed", comment: "c", payload: { summary: "s", commit: "c" }, reason: "stray prose" }) + "\n"
+        );
+      }
+      await execute(
+        contractReq("sess-real-3", workdir, {
+          allowedOutcomes: ["completed", "failed"],
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) },
+            { name: "failed", schema_json: Buffer.from(JSON.stringify(COMMITTED_SCHEMA)) },
+          ],
+        }),
+        helpers
+      );
+
+      const calls = readJSONL(path.join(workdir, "fake-cli-calls.jsonl"));
+      expect(calls).toHaveLength(3);
+      for (const call of calls) {
+        expect(call.isError).toBe(true);
+        const text = (call.content ?? []).map((block: any) => block?.text ?? "").join("");
+        expect(text).toContain('submit_outcome rejected: unknown parameter(s) "reason"');
+        expect(text).toContain('the declared parameters are "comment", "outcome", "payload"');
+      }
+
+      // Rejections chained on the same live session (never session-destroying).
+      const spawns = readJSONL(path.join(workdir, "fake-cli-spawns.jsonl"));
+      expect(spawns.length).toBe(3);
+      expect(spawns[1].resume).toBe(spawns[0].sessionId);
+      expect(spawns[2].resume).toBe(spawns[1].sessionId);
+
+      // The step terminally resolves as the invalid-parameters failure — the
+      // stray reason was never silently dropped into a successful finalize.
+      expect(eventsOf(helpers, "outcome.failure")).toEqual([
+        {
+          reason: "Agent completed without submitting a valid outcome after 3 finalize attempt(s) (invalid parameters).",
+          kind: "invalid_params",
+          allowed_outcomes: ["completed", "failed"],
+          attempts: 3,
+        },
+      ]);
+      expect(helpers.finalizeCalls).toEqual([
+        {
+          outcome: "failure",
+          opts: {
+            reason: "Agent completed without submitting a valid outcome after 3 finalize attempt(s) (invalid parameters).",
+          },
+        },
+      ]);
     },
     120_000
   );
