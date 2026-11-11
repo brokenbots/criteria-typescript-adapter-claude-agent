@@ -893,4 +893,47 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
       { outcome: "completed", opts: { comment: "fixed", payload: { summary: "s2", commit: "c2" } } },
     ]);
   });
+
+  test("Q4: a payload omitting a declared-but-not-required property finalizes at the handler (KB-261 optional payload lane)", async () => {
+    // Own fixture: `notes` is declared but NOT required. Every committed
+    // contract-mode fixture so far listed all declared properties in
+    // `required`, which is why the zod 4 z.unknown() non-optionality defect
+    // (bare z.unknown() rendered declared fields into the model-visible
+    // `required` array and rejected contract-valid payloads at the MCP
+    // bridge, before the handler) was invisible at this level.
+    const OPTIONAL_PROPERTY_SCHEMA = {
+      type: "object",
+      properties: { summary: { type: "string" }, notes: { type: "string" } },
+      required: ["summary"],
+    };
+    const helpers = startTurn({
+      calls: [{ outcome: "completed", comment: "c", payload: { summary: "s" } }],
+      sessionId: "sess-q4",
+    });
+    await execute(
+      contractReq(
+        {
+          outcomeContracts: [
+            { name: "completed", schema_json: Buffer.from(JSON.stringify(OPTIONAL_PROPERTY_SCHEMA)) },
+            { name: "failed", schema_json: Buffer.from(JSON.stringify(OPTIONAL_PROPERTY_SCHEMA)) },
+            { name: "gave_up", fallback: true },
+          ],
+        },
+        "sess-q4"
+      ),
+      helpers
+    );
+
+    // The contract-valid payload (missing the optional `notes`) reached the
+    // handler and finalized there — no bridge-level rejection, no
+    // payload_invalid event, no burned budget.
+    expect(handlerResults[0].isError).toBeFalsy();
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+    expect(eventsOf(helpers, "outcome.finalized")).toEqual([
+      { outcome: "completed", reason: digestOf({ summary: "s" }) },
+    ]);
+    expect(helpers.finalizeCalls).toEqual([
+      { outcome: "completed", opts: { comment: "c", payload: { summary: "s" } } },
+    ]);
+  });
 });
