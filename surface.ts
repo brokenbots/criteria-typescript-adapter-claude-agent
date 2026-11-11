@@ -26,7 +26,13 @@
 
 import { z } from "zod";
 import { createHash } from "node:crypto";
+import { canonicalJson } from "./redaction.js";
 import { contractSchemaCarrying, OutcomeContractView } from "./contract.js";
+
+// The canonical JSON renderer lives in the shared redaction module (both the
+// surface digest and the contract payload digest hash it); re-exported so
+// consumers keep importing it from the surface module.
+export { canonicalJson };
 
 /** Version prefix so a changed mapping policy re-binds every step surface. */
 export const SUBMIT_SURFACE_DIGEST_PREFIX = "submit-surface-v1";
@@ -326,23 +332,6 @@ function surfaceDigest(description: string, params: Record<string, unknown>): st
   const sum = createHash("sha256");
   sum.update(`${SUBMIT_SURFACE_DIGEST_PREFIX}\n${description}\n${canonicalJson(params)}`);
   return sum.digest("hex");
-}
-
-/**
- * Canonical JSON: object keys sorted (byte layouts collapse), arrays in
- * order. Matches the Go reference's json.Marshal map-key sorting closely
- * enough that the digest is stable for a given surface within this adapter.
- */
-export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
-  }
-  const keys = Object.keys(value).sort();
-  const parts = keys.map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`);
-  return `{${parts.join(",")}}`;
 }
 
 /**

@@ -26,6 +26,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { sanitizeReason, canonicalJson } from "./redaction.js";
 
 // ============================================================================
 // Pinned issue-string vocabulary (conformance/README.md, v0.7.0)
@@ -559,16 +560,22 @@ export function foldDeclaredPayloadParams(
  * validated payload — the schema's reason field when present — falling back
  * to a digest of the payload, so the display lane is never empty on typed
  * steps merely because the top-level parameter was absent.
+ *
+ * `secrets` (the adapter's held secret values) is redacted from both the
+ * prose render and the digest input, so the digest is not a stable
+ * fingerprint of secret material the agent placed in the payload (parity
+ * with the copilot adapter: sha256 over the redacted payload).
  */
 export function finalizedDisplayReason(
   view: OutcomeContractView | null,
   legacyReason: string,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  secrets: (string | undefined)[]
 ): string {
   if (!view || !contractSchemaCarrying(view)) {
-    return legacyReason;
+    return sanitizeReason(legacyReason, secrets);
   }
-  return typedFinalizedDisplayReason(view, payload);
+  return typedFinalizedDisplayReason(view, payload, secrets);
 }
 
 /** Whether the contract schema declares a top-level "reason" property. */
@@ -579,18 +586,22 @@ function schemaDeclaresReason(view: OutcomeContractView): boolean {
 /**
  * Display prose for a typed finalize: the payload's "reason" property when
  * the contract schema declares one and the payload carries non-empty prose,
- * else a sha256 digest of the payload (the full typed output travels on the
- * result lane, so the display lane stays cheap and non-empty).
+ * else a sha256 digest of the redacted canonical payload rendering (the full
+ * typed output travels on the result lane, so the display lane stays cheap
+ * and non-empty). Canonical (key-sorted) so semantically equal payloads hash
+ * equally regardless of key order; secret values the adapter holds are
+ * redacted before hashing, so the digest is not a fingerprint of secret
+ * material the agent placed in the payload.
  */
-function typedFinalizedDisplayReason(view: OutcomeContractView, payload: Record<string, unknown>): string {
+function typedFinalizedDisplayReason(view: OutcomeContractView, payload: Record<string, unknown>, secrets: (string | undefined)[]): string {
   if (schemaDeclaresReason(view)) {
     const prose = payload.reason;
     if (typeof prose === "string" && prose !== "") {
-      return prose;
+      return sanitizeReason(prose, secrets);
     }
   }
   const sum = createHash("sha256");
-  sum.update(JSON.stringify(payload));
+  sum.update(sanitizeReason(canonicalJson(payload), secrets));
   return "sha256:" + sum.digest("hex");
 }
 

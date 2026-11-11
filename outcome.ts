@@ -12,6 +12,12 @@
 
 import { z } from "zod";
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { REDACTED_PLACEHOLDER, sanitizeReason } from "./redaction.js";
+
+// The held-secret redaction primitives live in the shared redaction module
+// (contract.ts hashes redacted canonical payload renderings); re-exported so
+// consumers keep importing them from the outcome module.
+export { REDACTED_PLACEHOLDER, sanitizeReason };
 import {
   CALL_ERROR_HOST_UNSUPPORTED,
   CALL_ERROR_UNKNOWN_ADAPTER,
@@ -51,13 +57,6 @@ export const ADAPTER_TOOL_DESCRIPTION =
   "A failed call does not fail the step: it returns a typed error as this tool's result (isError), which you should " +
   'incorporate into your answer — give up after "host_unsupported", report the denial and continue after a denied call, ' +
   'and correct the target after "unknown_tool".';
-
-/**
- * Placeholder used when a secret value the adapter holds appears in the
- * agent-authored `reason` text. The replacement is visible so readers can see
- * that something was removed, rather than silently dropping it.
- */
-export const REDACTED_PLACEHOLDER = "[REDACTED]";
 
 /**
  * Calling `submit_outcome` is model behaviour, not a guarantee — the agent
@@ -169,32 +168,6 @@ export function createOutcomeState(): OutcomeState {
     finalizeFailureIssues: [],
     finalizedDisplayReason: "",
   };
-}
-
-/**
- * Best-effort redaction of secret values the adapter actually holds.
- *
- * This only removes verbatim occurrences of secrets the adapter has received
- * (currently ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN). It does not do
- * general-purpose secret detection, PII scrubbing, or entropy heuristics,
- * because those produce false positives that corrupt legitimate agent prose.
- * An agent's explanation may still contain other repository or user content;
- * consumers must decide where to route it.
- */
-export function sanitizeReason(reason: string, secrets: (string | undefined)[]): string {
-  const toRedact = secrets
-    .filter((s): s is string => typeof s === "string" && s.length > 0)
-    // Longer secrets first so a shorter value cannot slice a longer one.
-    .sort((a, b) => b.length - a.length);
-
-  let sanitized = reason;
-  for (const value of toRedact) {
-    // Escape regex metacharacters so the secret is matched literally.
-    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = new RegExp(escaped, "g");
-    sanitized = sanitized.replace(pattern, REDACTED_PLACEHOLDER);
-  }
-  return sanitized;
 }
 
 /**
@@ -616,7 +589,8 @@ function buildContractOutcomeMcpServer(options: BuildOutcomeServerOptions) {
           capture.finalizedDisplayReason = resolveFinalizedDisplayReason(
             outcomeContract,
             rawReason || comment,
-            capture.submittedPayload
+            capture.submittedPayload,
+            heldSecrets
           );
 
           await helpers.log.adapterEvent("outcome.finalized", {

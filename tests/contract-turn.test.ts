@@ -13,11 +13,12 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { FAKE_CLI, adapterPath } from "./helpers.js";
 import { missingCommentIssue, SUBMIT_OUTCOME_TOOL_NAME } from "../contract.js";
-import { MAX_FINALIZE_ATTEMPTS } from "../outcome.js";
+import { MAX_FINALIZE_ATTEMPTS, REDACTED_PLACEHOLDER } from "../outcome.js";
+import { canonicalJson, sanitizeReason } from "../redaction.js";
 
-/** The KB-263 typed display reason: a sha256 digest of the submitted payload. */
+/** The KB-263 typed display reason: a sha256 digest of the redacted canonical payload rendering (with no held secrets, redaction is identity). */
 function digestOf(value: unknown): string {
-  return "sha256:" + createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  return "sha256:" + createHash("sha256").update(sanitizeReason(canonicalJson(value), [])).digest("hex");
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +129,7 @@ const execute = mod.adapterConfig.execute as (req: any, helpers: any) => Promise
 // Harness
 // ---------------------------------------------------------------------------
 
-function makeHelpers(): any {
+function makeHelpers(heldSecrets?: { apiKey?: string; authToken?: string }): any {
   const sessionStore = new Map<string, any>();
   const events: Array<{ kind: string; payload: any }> = [];
   const finalizeCalls: Array<{ outcome: string; opts: any }> = [];
@@ -138,7 +139,13 @@ function makeHelpers(): any {
       get: (key: string) => sessionStore.get(key),
       set: (key: string, value: any) => void sessionStore.set(key, value),
     },
-    secrets: { get: async () => null },
+    secrets: {
+      get: async (name: string) => {
+        if (name === "ANTHROPIC_API_KEY") return heldSecrets?.apiKey ?? null;
+        if (name === "ANTHROPIC_AUTH_TOKEN") return heldSecrets?.authToken ?? null;
+        return null;
+      },
+    },
     log: {
       adapterEvent: async (kind: string, payload: any) => {
         events.push({ kind, payload });
@@ -166,11 +173,11 @@ function makeHelpers(): any {
   };
 }
 
-function startTurn(s: Script): any {
+function startTurn(s: Script, heldSecrets?: { apiKey?: string; authToken?: string }): any {
   script = s;
   captured.length = 0;
   handlerResults.length = 0;
-  const helpers = makeHelpers();
+  const helpers = makeHelpers(heldSecrets);
   helpers.session.set("claudeExecutable", FAKE_CLI);
   return helpers;
 }
@@ -235,6 +242,50 @@ describe("contract-mode turn (integration via adapterConfig.execute)", () => {
     expect(eventsOf(helpers, "outcome.recovered")).toEqual([]);
     expect(handlerResults[0].isError).toBeFalsy();
     expect(handlerResults[0].metadata.outcome).toBe("completed");
+  });
+
+  test("A2: the payload digest is a hash of the secret-REDACTED canonical rendering (KB-261)", async () => {
+    const apiKey = "sk-ant-api03-SECRET-VALUE-123456";
+    const payload = { summary: `used key ${apiKey} locally`, commit: "abc123" };
+    const helpers = startTurn(
+      { calls: [{ outcome: "completed", comment: "Fixed.", payload }], hang: true, sessionId: "sess-a2" },
+      { apiKey }
+    );
+    await execute(contractReq({}, "sess-a2"), helpers);
+
+    const events = eventsOf(helpers, "outcome.finalized");
+    expect(events).toHaveLength(1);
+    const reason = events[0].reason as string;
+    // The digest is computed over the redacted canonical payload, so it
+    // matches the same payload with the secret replaced by the placeholder —
+    // and differs from a digest of the raw secret-bearing payload (which
+    // would make the display lane a fingerprint of secret material).
+    const redactedPayload = { summary: `used key ${REDACTED_PLACEHOLDER} locally`, commit: "abc123" };
+    expect(reason).toBe(digestOf(redactedPayload));
+    expect(reason).not.toBe(digestOf(payload));
+    // The payload still travels on the finalize lane verbatim (redaction is
+    // the digest input's concern, not the result lane's).
+    expect(helpers.finalizeCalls[0].opts.payload).toEqual(payload);
+    expect(eventsOf(helpers, "outcome.payload_invalid")).toEqual([]);
+  });
+
+  test("A3: payload key order does not change the digest (canonical, key-sorted rendering)", async () => {
+    const first = startTurn({
+      calls: [{ outcome: "completed", comment: "done", payload: { summary: "s", commit: "abc" } }],
+      hang: true,
+      sessionId: "sess-a3-a",
+    });
+    await execute(contractReq({}, "sess-a3-a"), first);
+
+    const second = startTurn({
+      calls: [{ outcome: "completed", comment: "done", payload: { commit: "abc", summary: "s" } }],
+      hang: true,
+      sessionId: "sess-a3-b",
+    });
+    await execute(contractReq({}, "sess-a3-b"), second);
+
+    expect(eventsOf(first, "outcome.finalized")[0].reason).toBe(eventsOf(second, "outcome.finalized")[0].reason);
+    expect(eventsOf(first, "outcome.finalized")[0].reason).toBe(digestOf({ summary: "s", commit: "abc" }));
   });
 
   test("B: rejected payloads loop in-turn and the contract fallback fires at budget exhaustion", async () => {
