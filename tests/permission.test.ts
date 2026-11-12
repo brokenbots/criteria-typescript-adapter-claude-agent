@@ -685,6 +685,143 @@ describe("permission handling", () => {
   }, 30_000);
 });
 
+describe("permission router fail-closed contract (KB-261 layer-2 negative paths)", () => {
+  let mod: any;
+  let negSeq = 0;
+
+  beforeAll(async () => {
+    // Re-assert the default SDK mock: earlier tests in the file register
+    // scenario-specific overrides; the negative paths never run Execute, so
+    // the default MockQuery is the shape they must be isolated with.
+    mockClaudeSdk();
+    mod = await import(`${adapterPath}?neg-${++negSeq}`);
+  });
+
+  /** Start a host with a live session and acquire its single routed consumer. */
+  async function routedHost(): Promise<{ host: TestHost; router: PermissionRequestRouter }> {
+    const host = new TestHost({ config: mod.adapterConfig });
+    await host.start();
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    return { host, router: PermissionRequestRouter.acquire(host) };
+  }
+
+  /** Record every decision write on the Permissions stream (no second delivery can hide). */
+  function spyWrites(router: PermissionRequestRouter): { writes: string[] } {
+    const writes: string[] = [];
+    const stream = router.stream as any;
+    const orig = stream.write.bind(stream);
+    stream.write = (msg: any) => {
+      writes.push(JSON.stringify(msg));
+      return orig(msg);
+    };
+    return { writes };
+  }
+
+  test("duplicate route() of the same requestId is a typed defect and is never re-delivered", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.route("perm-dup", {});
+    router.grant(1);
+    expect(router.routedCount()).toBe(1);
+
+    // The same requestId observed again on the wire: correlated exactly once —
+    // the duplicate routing is a typed defect, the route state is unchanged,
+    // and releasing the decision again must NOT write a second delivery.
+    router.route("perm-dup", {});
+    router.grant(1);
+
+    expect(router.defects().length).toBe(2);
+    expect(router.defects()[0]).toContain("permission.request perm-dup routed more than once");
+    expect(router.defects()[1]).toContain("second decision for already-resolved perm-dup");
+    expect(router.routedCount()).toBe(1);
+    expect(router.grantedCount()).toBe(1);
+    expect(writes.length).toBe(1);
+    await host.stop();
+  }, 30_000);
+
+  test("grant() after the consumer died is fail-closed: typed stale-consumer defect, nothing written", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.route("perm-dead", {});
+    expect(router.consumerDeath()).toBeNull();
+
+    // Consumer death via the stream error path the router already handles
+    // (gRPC transport reset): the router captures the dead reason, and every
+    // later delivery attempt fails closed — never resolved as an allow.
+    (router.stream as any).emit("error", new Error("simulated channel death"));
+    expect(router.consumerDeath()).toBe("Error: simulated channel death");
+
+    router.grant(1);
+
+    expect(router.defects().length).toBe(1);
+    expect(router.defects()[0]).toContain(
+      "would deliver to a stale consumer (Error: simulated channel death)"
+    );
+    expect(router.grantedCount()).toBe(0);
+    expect(writes.length).toBe(0);
+    await host.stop();
+  }, 30_000);
+
+  test("grant() for an uncorrelated request is a typed defect and never written", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.grant(1);
+
+    expect(router.defects().length).toBe(1);
+    expect(router.defects()[0]).toContain("grant(1) targets an uncorrelated request");
+    expect(router.routedCount()).toBe(0);
+    expect(router.grantedCount()).toBe(0);
+    expect(writes.length).toBe(0);
+    await host.stop();
+  }, 30_000);
+
+  test("noteDeliveryFailure() records the typed defect, sets the dead reason, and stays fail-closed", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.route("perm-fail", {});
+    router.noteDeliveryFailure("perm-fail", new Error("write failed: connection dropped"));
+
+    expect(router.defects().length).toBe(1);
+    expect(router.defects()[0]).toContain(
+      "decision delivery failed (perm-fail): Error: write failed: connection dropped"
+    );
+    expect(router.consumerDeath()).toBe("decision delivery failed on the routed consumer");
+    // Fail-closed: the undelivered decision is never silently re-delivered
+    // as an allow afterwards; a later release attempt is itself a defect.
+    router.grant(1);
+    expect(router.grantedCount()).toBe(0);
+    expect(writes.length).toBe(0);
+    expect(router.defects().length).toBe(2);
+    expect(router.defects()[1]).toContain("would deliver to a stale consumer");
+    await host.stop();
+  }, 30_000);
+
+  test("executeWithOutputs rejects typed when a timer-queued permission delay is requested", async () => {
+    const { host, router } = await routedHost();
+    (host as any)._autoGrantPermissions = true;
+    (host as any)._permissionDelayMs = 50;
+
+    let rejected: unknown;
+    try {
+      await executeWithOutputs(host, { stepName: "timer-path", allowedOutcomes: ["success"] });
+    } catch (err) {
+      rejected = err;
+    }
+
+    expect(rejected).toBeInstanceOf(Error);
+    expect(String(rejected)).toContain("permissionDelayMs");
+    expect(String(rejected)).toContain("PermissionRequestRouter");
+    // The timer path never started a step: nothing routed, nothing resolved.
+    expect(router.routedCount()).toBe(0);
+    expect(router.grantedCount()).toBe(0);
+    await host.stop();
+  }, 30_000);
+});
+
 describe("permission-bridge quiesce (KB-261 ruling addendum)", () => {
   test("invariant: step result cannot finalize while a permission decision is in flight", async () => {
     // The hazard from merge-CI (real-CLI under load, KB-396 class): the query

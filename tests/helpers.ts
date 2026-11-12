@@ -203,6 +203,15 @@ export function mockClaudeSdk(queryFactory?: (opts: any) => AsyncIterable<any>) 
  * A request that cannot be correlated (no requestId), is routed twice, or
  * whose decision would be delivered on a dead/stale consumer is recorded as a
  * typed routing defect and fails closed — it is never silently re-granted.
+ *
+ * Evidence history (KB-261): the CI hypothesis that a request could be
+ * swallowed by a stale/no-op Permissions() consumer was empirically falsified
+ * — every gRPC on("data") listener on the same stream receives every message
+ * (no multiplexing loss). The real `[1]`-vs-`[1,2]` merge-CI failures (GH runs
+ * 42952988470, 42973180457, 43278380898; local 6/8 under 4-core contention)
+ * were grant-setTimeout starvation under runner load, so the timer grant path
+ * is structurally removed here rather than guarded: requests are correlated
+ * by requestId through exactly ONE consumer and releases are event-driven.
  */
 export class PermissionRequestRouter {
   private readonly permStream: any;
@@ -293,10 +302,35 @@ export class PermissionRequestRouter {
     });
   }
 
-  /** Resolve when count requests have been routed (event-driven; no polling). */
-  waitRouted(count: number): Promise<void> {
+  /**
+   * Resolve when count requests have been routed (event-driven; no polling).
+   * Deterministically bounded: if the wire never delivers the request, the
+   * waiter rejects after timeoutMs with a typed message naming what was
+   * routed — a fast, readable failure instead of a wall-clock test kill
+   * (bun discards stderr when it kills a test).
+   */
+  waitRouted(count: number, timeoutMs = 15_000): Promise<void> {
     if (this.routes.length >= count) return Promise.resolve();
-    return new Promise((resolve) => this.pendingWaits.push({ needed: count, resolve }));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(
+          new Error(
+            `permission router did not see ${count} request(s) routed within ${timeoutMs}ms ` +
+              `(${this.routes.length} routed so far` +
+              (this.routes.length ? `: ${this.routes.map((r) => r.requestId).join(", ")}` : "") +
+              `)`
+          )
+        );
+      }, timeoutMs);
+      (timer as any).unref?.();
+      this.pendingWaits.push({
+        needed: count,
+        resolve: () => {
+          clearTimeout(timer);
+          resolve();
+        },
+      });
+    });
   }
 
   /**
