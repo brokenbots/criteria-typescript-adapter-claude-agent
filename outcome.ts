@@ -136,6 +136,13 @@ export interface OutcomeState {
    * it from the submitted payload (schema reason, else a sha256 digest).
    */
   finalizedDisplayReason: string;
+  /**
+   * KB-261 ruling addendum: tool names whose permission decisions were still
+   * in flight when the step result tried to finalize, past the drain bound.
+   * Non-empty forces a typed step failure — any captured outcome is discarded
+   * because the wire state was indeterminate when it was recorded.
+   */
+  permissionUnresolvedTools: string[];
 }
 
 export interface BuildOutcomeServerOptions {
@@ -168,6 +175,7 @@ export function createOutcomeState(): OutcomeState {
     finalizedViaTool: false,
     finalizeFailureIssues: [],
     finalizedDisplayReason: "",
+    permissionUnresolvedTools: [],
   };
 }
 
@@ -675,6 +683,30 @@ export type ResolvedOutcome = FinalizeResolution;
  */
 export async function resolveOutcome(options: ResolveOutcomeOptions): Promise<ResolvedOutcome> {
   const { state, allowedOutcomes, attempts, helpers, heldSecrets, contracts } = options;
+
+  // 0. KB-261 ruling addendum: a permission decision was still in flight when
+  // the step tried to finalize — past the drain bound. No tolerant fallback:
+  // the wire state was indeterminate at capture time, so any submitted or
+  // captured outcome is discarded and the step fails typed with the
+  // unresolved tools named.
+  if (state.permissionUnresolvedTools.length > 0) {
+    const unresolvedList = truncateText(state.permissionUnresolvedTools.join(", "), 400);
+    const base = `Step cannot finalize: permission decision(s) for tool(s) [${unresolvedList}] were still in flight when the step result arrived, past the permission-bridge drain bound. The step result cannot be trusted while a permission decision is unresolved.`;
+    const superseded = state.finalized
+      ? " The captured outcome was discarded because the finalize raced an in-flight permission decision."
+      : "";
+    const reason = sanitizeReason(base + superseded, heldSecrets);
+    await helpers.log.adapterEvent("outcome.failure", {
+      reason,
+      kind: "permission_quiesce_timeout",
+      pending_tools: state.permissionUnresolvedTools,
+      attempts,
+    });
+    if (allowedOutcomes.includes("needs_review")) {
+      return { outcome: "needs_review", reason };
+    }
+    return { outcome: "failure", reason };
+  }
 
   // 1. Valid submitted outcome: already emitted outcome.finalized by the tool.
   if (state.finalized && state.finalizedOutcome) {
