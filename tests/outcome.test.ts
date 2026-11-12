@@ -322,6 +322,49 @@ describe("outcome module", () => {
     expect(resolved.reason).toContain("Agent query failed");
     expect(resolved.reason).toContain("the agent crashed");
   });
+
+  test("resolveOutcome discards a captured outcome when permission decisions were unresolved (KB-261)", async () => {
+    const state = createOutcomeState();
+    state.finalized = true;
+    state.finalizedOutcome = "success";
+    state.finalizedReason = "submitted before the drain bound";
+    state.permissionUnresolvedTools = ["Bash", "Read"];
+
+    const helpers = makeHelpers();
+    const resolved = await resolveOutcome({
+      state,
+      allowedOutcomes: ["success", "failure"],
+      attempts: 1,
+      helpers,
+      heldSecrets: [],
+    });
+
+    expect(resolved.outcome).toBe("failure");
+    expect(resolved.reason).toContain("permission decision(s) for tool(s) [Bash, Read]");
+    expect(resolved.reason).toContain("was discarded");
+    expect(helpers.events).toHaveLength(1);
+    expect(helpers.events[0].kind).toBe("outcome.failure");
+    expect(helpers.events[0].payload.kind).toBe("permission_quiesce_timeout");
+  });
+
+  test("resolveOutcome prefers needs_review on a permission-bridge failure when allowed (KB-261)", async () => {
+    const state = createOutcomeState();
+    state.permissionUnresolvedTools = ["Bash"];
+
+    const helpers = makeHelpers();
+    const resolved = await resolveOutcome({
+      state,
+      allowedOutcomes: ["success", "needs_review"],
+      attempts: 1,
+      helpers,
+      heldSecrets: [],
+    });
+
+    expect(resolved.outcome).toBe("needs_review");
+    expect(resolved.reason).toContain("permission decision(s) for tool(s) [Bash]");
+    expect(helpers.events[0].kind).toBe("outcome.failure");
+    expect(helpers.events[0].payload.kind).toBe("permission_quiesce_timeout");
+  });
 });
 
 describe("outcome integration", () => {
