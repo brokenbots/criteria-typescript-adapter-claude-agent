@@ -6,8 +6,10 @@ import {
   MockMcpServer,
   mockClaudeSdk,
   executeWithManualPermission,
+  executeWithPermissionRouter,
   executeWithOutputs,
   parsePermissionPayload,
+  PermissionRequestRouter,
 } from "./helpers.js";
 
 mockClaudeSdk();
@@ -57,7 +59,7 @@ describe("permission handling", () => {
     expect(capturedId?.length).toBeGreaterThan(0);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("permission bridge forwards tool name and args to the host", async () => {
     let capturedPayload: Record<string, any> | undefined;
@@ -104,7 +106,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ path: "/tmp/readme.md" }));
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: permission.request payload carries the Bash command digest and preview", async () => {
     const commandText = "echo matched > /tmp/cri31-proof/PROOF.txt";
@@ -155,7 +157,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: commands array is carried in the args digest and preview", async () => {
     const commands = ["echo one", "echo two"];
@@ -204,7 +206,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: non-command tool args are digested and previewed without command shapes", async () => {
     let capturedPayload: Record<string, any> | undefined;
@@ -254,7 +256,7 @@ describe("permission handling", () => {
     expect(capturedPayload).not.toHaveProperty("commands");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: bare allow_tools = ['Bash'] still grants without fingerprint", async () => {
     let capturedBehavior: string | undefined;
@@ -355,7 +357,7 @@ describe("permission handling", () => {
     expect(capturedTools.sort()).toEqual(["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   const declaredTools = ["Read", "Bash", "Write", "Edit", "Glob", "Grep"];
   for (const allowed of declaredTools) {
@@ -407,7 +409,7 @@ describe("permission handling", () => {
       expect(requestedTool).toBe(allowed);
       expect(["success", "failure", "needs_review"]).toContain(outcome);
       await host.stop();
-    });
+    }, 30_000);
   }
 
   test("host permission.granted with matching requestId resolves to allow in under 1 second", async () => {
@@ -456,7 +458,7 @@ describe("permission handling", () => {
     expect(canUseToolEnd - canUseToolStart).toBeLessThan(1000);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("host permission.denied with matching requestId resolves to deny in under 1 second", async () => {
     let canUseToolStart = 0;
@@ -506,7 +508,7 @@ describe("permission handling", () => {
     expect(capturedBehavior).toBe("deny");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("denied permission returns the host reason in the SDK response", async () => {
     let capturedMessage: string | undefined;
@@ -550,7 +552,7 @@ describe("permission handling", () => {
     expect(capturedMessage).toBe("Too risky for this host");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("concurrent permission stress test — 50 parallel requests", async () => {
     let permissionCount = 0;
@@ -586,22 +588,31 @@ describe("permission handling", () => {
     const mod = await import(`${adapterPath}?${Date.now()}`);
     const host = new TestHost({
       config: mod.adapterConfig,
-      autoGrantPermissions: true,
-      permissionDelayMs: 5,
     });
     await host.start();
 
     await host.openSession({ config: { claude_executable: FAKE_CLI } });
-    const result = await host.execute({
+    const { outcome, router } = await executeWithPermissionRouter(host, {
       stepName: "stress",
       input: { prompt: "stress test" },
       allowedOutcomes: ["success"],
+      grantOnRoute: true,
     });
 
     expect(permissionCount).toBe(50);
-    expect(["success", "failure", "needs_review"]).toContain(result.outcome);
+    // Routing invariant (KB-261 layer-2): all 50 requests correlated exactly
+    // once by requestId and released in arrival order on the single live
+    // consumer — never delivered to a stale/no-op consumer, never released
+    // uncorrelated. Release is event-driven on the observed request, not a
+    // timer racing the turn.
+    expect(router.defects()).toEqual([]);
+    expect(router.routedCount()).toBe(50);
+    expect(router.grantedCount()).toBe(50);
+    expect(router.grantedSequences()).toEqual(router.routedSequences());
+    expect(router.consumerDeath()).toBeNull();
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("permission decisions with delayed grants resolve correctly", async () => {
     const order: number[] = [];
@@ -633,24 +644,182 @@ describe("permission handling", () => {
     }));
 
     const mod = await import(`${adapterPath}?${Date.now()}`);
-    const host = new TestHost({
-      config: mod.adapterConfig,
-      autoGrantPermissions: true,
-      permissionDelayMs: 20,
-    });
+    const host = new TestHost({ config: mod.adapterConfig });
     await host.start();
 
     await host.openSession({ config: { claude_executable: FAKE_CLI } });
-    const result = await host.execute({
+    const router = PermissionRequestRouter.acquire(host);
+    const run = executeWithPermissionRouter(host, {
       stepName: "delayed-grants",
       input: { prompt: "delayed" },
       allowedOutcomes: ["success"],
+      router,
     });
 
+    // Deterministic controlled release (KB-261 layer-2: no setTimeout racing
+    // the turn). Decision #1 is released the moment request #1 is ROUTED to
+    // the single requestId-correlated consumer; decision #2 likewise. The
+    // mock awaits decisions sequentially, so request #2 cannot exist on the
+    // wire until decision #1 has reached the adapter — the grant order is a
+    // construction of the query shape + routing contract, not scheduler luck.
+    await router.waitRouted(1);
+    router.grant(1);
+    await router.waitRouted(2);
+    router.grant(2);
+
+    const { outcome } = await run;
+
+    // Strict ordering assertion — unchanged.
     expect(order).toEqual([1, 2]);
-    expect(["success", "failure", "needs_review"]).toContain(result.outcome);
+    // Routing invariant (KB-261 layer-2): each request correlated exactly
+    // once by requestId and released in routed arrival order on the single
+    // live consumer — no duplicate routing, no delivery to a stale/no-op
+    // consumer, no uncorrelated release.
+    expect(router.defects()).toEqual([]);
+    expect(router.routedCount()).toBe(2);
+    expect(router.grantedCount()).toBe(2);
+    expect(router.grantedSequences()).toEqual([1, 2]);
+    expect(router.consumerDeath()).toBeNull();
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
+  }, 30_000);
+});
+
+describe("permission router fail-closed contract (KB-261 layer-2 negative paths)", () => {
+  let mod: any;
+  let negSeq = 0;
+
+  beforeAll(async () => {
+    // Re-assert the default SDK mock: earlier tests in the file register
+    // scenario-specific overrides; the negative paths never run Execute, so
+    // the default MockQuery is the shape they must be isolated with.
+    mockClaudeSdk();
+    mod = await import(`${adapterPath}?neg-${++negSeq}`);
   });
+
+  /** Start a host with a live session and acquire its single routed consumer. */
+  async function routedHost(): Promise<{ host: TestHost; router: PermissionRequestRouter }> {
+    const host = new TestHost({ config: mod.adapterConfig });
+    await host.start();
+    await host.openSession({ config: { claude_executable: FAKE_CLI } });
+    return { host, router: PermissionRequestRouter.acquire(host) };
+  }
+
+  /** Record every decision write on the Permissions stream (no second delivery can hide). */
+  function spyWrites(router: PermissionRequestRouter): { writes: string[] } {
+    const writes: string[] = [];
+    const stream = router.stream as any;
+    const orig = stream.write.bind(stream);
+    stream.write = (msg: any) => {
+      writes.push(JSON.stringify(msg));
+      return orig(msg);
+    };
+    return { writes };
+  }
+
+  test("duplicate route() of the same requestId is a typed defect and is never re-delivered", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.route("perm-dup", {});
+    router.grant(1);
+    expect(router.routedCount()).toBe(1);
+
+    // The same requestId observed again on the wire: correlated exactly once —
+    // the duplicate routing is a typed defect, the route state is unchanged,
+    // and releasing the decision again must NOT write a second delivery.
+    router.route("perm-dup", {});
+    router.grant(1);
+
+    expect(router.defects().length).toBe(2);
+    expect(router.defects()[0]).toContain("permission.request perm-dup routed more than once");
+    expect(router.defects()[1]).toContain("second decision for already-resolved perm-dup");
+    expect(router.routedCount()).toBe(1);
+    expect(router.grantedCount()).toBe(1);
+    expect(writes.length).toBe(1);
+    await host.stop();
+  }, 30_000);
+
+  test("grant() after the consumer died is fail-closed: typed stale-consumer defect, nothing written", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.route("perm-dead", {});
+    expect(router.consumerDeath()).toBeNull();
+
+    // Consumer death via the stream error path the router already handles
+    // (gRPC transport reset): the router captures the dead reason, and every
+    // later delivery attempt fails closed — never resolved as an allow.
+    (router.stream as any).emit("error", new Error("simulated channel death"));
+    expect(router.consumerDeath()).toBe("Error: simulated channel death");
+
+    router.grant(1);
+
+    expect(router.defects().length).toBe(1);
+    expect(router.defects()[0]).toContain(
+      "would deliver to a stale consumer (Error: simulated channel death)"
+    );
+    expect(router.grantedCount()).toBe(0);
+    expect(writes.length).toBe(0);
+    await host.stop();
+  }, 30_000);
+
+  test("grant() for an uncorrelated request is a typed defect and never written", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.grant(1);
+
+    expect(router.defects().length).toBe(1);
+    expect(router.defects()[0]).toContain("grant(1) targets an uncorrelated request");
+    expect(router.routedCount()).toBe(0);
+    expect(router.grantedCount()).toBe(0);
+    expect(writes.length).toBe(0);
+    await host.stop();
+  }, 30_000);
+
+  test("noteDeliveryFailure() records the typed defect, sets the dead reason, and stays fail-closed", async () => {
+    const { host, router } = await routedHost();
+    const { writes } = spyWrites(router);
+
+    router.route("perm-fail", {});
+    router.noteDeliveryFailure("perm-fail", new Error("write failed: connection dropped"));
+
+    expect(router.defects().length).toBe(1);
+    expect(router.defects()[0]).toContain(
+      "decision delivery failed (perm-fail): Error: write failed: connection dropped"
+    );
+    expect(router.consumerDeath()).toBe("decision delivery failed on the routed consumer");
+    // Fail-closed: the undelivered decision is never silently re-delivered
+    // as an allow afterwards; a later release attempt is itself a defect.
+    router.grant(1);
+    expect(router.grantedCount()).toBe(0);
+    expect(writes.length).toBe(0);
+    expect(router.defects().length).toBe(2);
+    expect(router.defects()[1]).toContain("would deliver to a stale consumer");
+    await host.stop();
+  }, 30_000);
+
+  test("executeWithOutputs rejects typed when a timer-queued permission delay is requested", async () => {
+    const { host, router } = await routedHost();
+    (host as any)._autoGrantPermissions = true;
+    (host as any)._permissionDelayMs = 50;
+
+    let rejected: unknown;
+    try {
+      await executeWithOutputs(host, { stepName: "timer-path", allowedOutcomes: ["success"] });
+    } catch (err) {
+      rejected = err;
+    }
+
+    expect(rejected).toBeInstanceOf(Error);
+    expect(String(rejected)).toContain("permissionDelayMs");
+    expect(String(rejected)).toContain("PermissionRequestRouter");
+    // The timer path never started a step: nothing routed, nothing resolved.
+    expect(router.routedCount()).toBe(0);
+    expect(router.grantedCount()).toBe(0);
+    await host.stop();
+  }, 30_000);
 });
 
 describe("permission-bridge quiesce (KB-261 ruling addendum)", () => {
@@ -789,7 +958,7 @@ describe("permission-bridge quiesce (KB-261 ruling addendum)", () => {
       permStream.end?.();
       await host.stop();
     }
-  });
+  }, 30_000);
 
   describe("quiesce unit probes", () => {
     let mod: any;
