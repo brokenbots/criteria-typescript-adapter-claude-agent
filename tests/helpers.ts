@@ -1,6 +1,7 @@
 import { TestHost } from "@criteria/adapter-sdk/testing";
 import { fromProtoStruct } from "../node_modules/@criteria/adapter-sdk/dist/plugin/server-v2.js";
 import { mock } from "bun:test";
+import { appendFileSync } from "node:fs";
 
 import { ADAPTER_TOOL_TOOL_NAME } from "../outcome.js";
 
@@ -212,6 +213,24 @@ export class PermissionRequestRouter {
   private deadReason: string | null = null;
   private pendingWaits: Array<{ needed: number; resolve: () => void }> = [];
 
+  static trace(tag: string, detail?: unknown): void {
+    const path = process.env.PERM_ROUTER_TRACE;
+    if (!path) return;
+    let line = `${Date.now()} ${tag}`;
+    if (detail !== undefined) {
+      try {
+        line += ` ${JSON.stringify(detail)}`;
+      } catch {
+        line += ` [unserializable]`;
+      }
+    }
+    try {
+      appendFileSync(path, `${line}\n`);
+    } catch {
+      // tracing must never break the harness
+    }
+  }
+
   private constructor(permStream: any) {
     this.permStream = permStream;
     // The router is the single handled consumer of its Permissions stream:
@@ -224,6 +243,7 @@ export class PermissionRequestRouter {
     });
     this.permStream.on("error", (err: any) => {
       this.deadReason = String(err ?? "Permissions consumer died");
+      PermissionRequestRouter.trace("permStream.error", { deadReason: this.deadReason });
     });
   }
 
@@ -263,6 +283,7 @@ export class PermissionRequestRouter {
     this.routedIds.add(requestId);
     const sequence = this.routes.length + 1;
     this.routes.push({ requestId, sequence, payload });
+    PermissionRequestRouter.trace("route", { requestId, routedCount: this.routes.length });
     this.pendingWaits = this.pendingWaits.filter((w) => {
       if (this.routes.length >= w.needed) {
         w.resolve();
@@ -305,6 +326,7 @@ export class PermissionRequestRouter {
       this.permStream.write({ request: { requestId: entry.requestId } });
       this.grants.push({ requestId: entry.requestId, sequence: entry.sequence, kind: "allow" });
     }
+    PermissionRequestRouter.trace("grant.write", { requestId: entry.requestId, sequence: entry.sequence, kind: opts?.deny_reason !== undefined ? "deny" : "allow" });
   }
 
   /** Release every routed-but-unresolved decision in arrival order (event-driven auto-grant). */
@@ -339,6 +361,19 @@ export class PermissionRequestRouter {
   /** Typed reason if the single consumer died mid-step (routing cannot continue). */
   consumerDeath(): string | null {
     return this.deadReason;
+  }
+
+  /**
+   * Record a typed defect when a decision could not be DELIVERED on the
+   * routed consumer (write after stream death, transport reset). Fail-closed
+   * per KB-261 layer-2: the undelivered decision never resolves as an allow;
+   * the server drains unanswered requests as denials at stream close.
+   */
+  noteDeliveryFailure(requestId: string | undefined, err: unknown): void {
+    this.defectLog.push(
+      `decision delivery failed (${requestId ?? "uncorrelated"}): ${String(err)}`
+    );
+    this.deadReason = this.deadReason ?? "decision delivery failed on the routed consumer";
   }
 }
 
@@ -383,6 +418,7 @@ export async function executeWithPermissionRouter(
       if (resolved) return;
       if (evt.result) {
         resolved = true;
+        PermissionRequestRouter.trace("exec.result", { stepName: opts.stepName });
         resolve(evt.result);
         return;
       }
@@ -395,9 +431,11 @@ export async function executeWithPermissionRouter(
       if (opts.grantOnRoute) router.grantAllArrived();
     });
     execStream.on("error", (err: any) => {
+      PermissionRequestRouter.trace("exec.error", { stepName: opts.stepName, message: String(err) });
       if (!resolved) reject(err);
     });
     execStream.on("end", () => {
+      PermissionRequestRouter.trace("exec.end", { stepName: opts.stepName });
       if (!resolved) reject(new Error("Execute stream ended without result"));
     });
   });
@@ -554,7 +592,16 @@ export async function executeWithManualPermission(
           payload?.fields?.requestId?.stringValue ??
           payload?.fields?.request_id?.stringValue;
         router.route(reqId, parsePermissionPayload(payload));
-        if (reqId) opts.onRequest(reqId, permStream, payload);
+        if (reqId) {
+          try {
+            opts.onRequest(reqId, permStream, payload);
+          } catch (err) {
+            // Fail closed (KB-261 layer-2): a decision that cannot be written
+            // on the routed consumer is a typed routing defect, never an
+            // unhandled crash and never a tolerant fallback re-delivery.
+            router.noteDeliveryFailure(reqId, err);
+          }
+        }
       }
     });
 

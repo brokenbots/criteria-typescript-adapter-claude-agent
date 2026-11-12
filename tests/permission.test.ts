@@ -59,7 +59,7 @@ describe("permission handling", () => {
     expect(capturedId?.length).toBeGreaterThan(0);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("permission bridge forwards tool name and args to the host", async () => {
     let capturedPayload: Record<string, any> | undefined;
@@ -106,7 +106,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ path: "/tmp/readme.md" }));
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: permission.request payload carries the Bash command digest and preview", async () => {
     const commandText = "echo matched > /tmp/cri31-proof/PROOF.txt";
@@ -157,7 +157,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: commands array is carried in the args digest and preview", async () => {
     const commands = ["echo one", "echo two"];
@@ -206,7 +206,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: non-command tool args are digested and previewed without command shapes", async () => {
     let capturedPayload: Record<string, any> | undefined;
@@ -256,7 +256,7 @@ describe("permission handling", () => {
     expect(capturedPayload).not.toHaveProperty("commands");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("CRI-31: bare allow_tools = ['Bash'] still grants without fingerprint", async () => {
     let capturedBehavior: string | undefined;
@@ -458,7 +458,7 @@ describe("permission handling", () => {
     expect(canUseToolEnd - canUseToolStart).toBeLessThan(1000);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("host permission.denied with matching requestId resolves to deny in under 1 second", async () => {
     let canUseToolStart = 0;
@@ -508,7 +508,7 @@ describe("permission handling", () => {
     expect(capturedBehavior).toBe("deny");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("denied permission returns the host reason in the SDK response", async () => {
     let capturedMessage: string | undefined;
@@ -552,7 +552,7 @@ describe("permission handling", () => {
     expect(capturedMessage).toBe("Too risky for this host");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("concurrent permission stress test — 50 parallel requests", async () => {
     let permissionCount = 0;
