@@ -303,7 +303,114 @@ function resolveClaudeExecutable(configured?: string): string | undefined {
 // Permission Bridge
 // ============================================================================
 
-function buildCanUseTool(helpers: Helpers) {
+/**
+ * KB-261 ruling addendum: bound on the drain of in-flight permission
+ * decisions before a step result may finalize. Past this bound the step
+ * fails typed (no tolerant fallback) naming the unresolved tools.
+ */
+const PERMISSION_QUIESCE_TIMEOUT_MS = 10_000;
+
+/** One in-flight permission decision and its settlement waiter. */
+interface PermissionDecisionEntry {
+  toolName: string;
+  /** Settles on allow, deny, or terminal rejection of the decision. */
+  settled: Promise<void>;
+}
+
+/**
+ * Tracks every permission decision the adapter bridge opens during an
+ * execute, so the step can guarantee none is still in flight at finalize
+ * time. Settlement is resolution OR rejection (rejection is terminal too).
+ */
+export interface PermissionDecisionTracker {
+  /** Registers a decision synchronously, before it is awaited. */
+  track(toolName: string, decision: Promise<unknown>): void;
+  /** Currently unsettled decisions. */
+  pending(): PermissionDecisionEntry[];
+}
+
+export function createPermissionDecisionTracker(): PermissionDecisionTracker {
+  const entries = new Set<PermissionDecisionEntry>();
+  return {
+    track(toolName, decision) {
+      const entry: PermissionDecisionEntry = {
+        toolName,
+        settled: decision.then(
+          () => {},
+          () => {}
+        ),
+      };
+      void entry.settled.then(() => entries.delete(entry));
+      entries.add(entry);
+    },
+    pending() {
+      return [...entries];
+    },
+  };
+}
+
+/**
+ * Drain (deterministically, bounded by `timeoutMs`) every permission decision
+ * still in flight on the bridge. Returns the tool names that remained
+ * unresolved past the bound (empty array = clean drain). Emits
+ * `permission.quiesce_started` once when work is found, then
+ * `permission.quiesce_drained` with the drain verdict.
+ */
+export async function quiescePermissionDecisions(
+  tracker: PermissionDecisionTracker,
+  helpers: Helpers,
+  timeoutMs: number = PERMISSION_QUIESCE_TIMEOUT_MS
+): Promise<string[]> {
+  const unresolvedToolNames = (snapshot: PermissionDecisionEntry[]) =>
+    [...new Set(snapshot.map((entry) => entry.toolName))];
+
+  const initial = tracker.pending();
+  if (initial.length === 0) return [];
+
+  await helpers.log.adapterEvent("permission.quiesce_started", {
+    pendingTools: unresolvedToolNames(initial),
+    timeoutMs,
+  });
+
+  // Re-gather loop: settle every entry seen so far, then re-check (belt and
+  // braces — no new decisions can originate after the queries ended).
+  const drainer = (async () => {
+    for (;;) {
+      const pendingNow = tracker.pending();
+      if (pendingNow.length === 0) return;
+      await Promise.all(pendingNow.map((entry) => entry.settled));
+    }
+  })();
+
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      resolve();
+    }, timeoutMs);
+  });
+  timer!.unref?.();
+
+  try {
+    await Promise.race([drainer, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // Ground truth, not race-luck: whatever is still unsettled now is what the
+  // step must fail on.
+  const unresolved = unresolvedToolNames(tracker.pending());
+  await helpers.log.adapterEvent("permission.quiesce_drained", {
+    drained: unresolved.length === 0,
+    timedOut,
+    unresolvedTools: unresolved,
+    timeoutMs,
+  });
+  return unresolved;
+}
+
+function buildCanUseTool(helpers: Helpers, tracker: PermissionDecisionTracker) {
   return async (
     toolName: string,
     input: Record<string, unknown>,
@@ -317,16 +424,21 @@ function buildCanUseTool(helpers: Helpers) {
   ): Promise<PermissionResult> => {
     // CRI-179 SDK contract: the host fingerprints args itself via the
     // canonical-JSON args digest, so only tool + args travel on the wire.
-    const decision = await helpers.permission.request({
+    const decision = helpers.permission.request({
       tool: toolName,
       args: input,
     });
-    if (decision.decision === "allow") {
+    // KB-261: every decision opened on the bridge must be settled (allowed,
+    // denied, or terminally errored) before the step result finalizes. Track
+    // synchronously so even a same-tick turn of the stream is captured.
+    tracker.track(toolName, decision);
+    const settledDecision = await decision;
+    if (settledDecision.decision === "allow") {
       return { behavior: "allow", toolUseID: options.toolUseID };
     }
     return {
       behavior: "deny",
-      message: decision.reason || "Denied by host",
+      message: settledDecision.reason || "Denied by host",
       toolUseID: options.toolUseID,
     };
   };
@@ -526,6 +638,10 @@ async function runExecuteStep(
   const heldSecrets = [apiKey, authToken];
 
   const outcomeState = createOutcomeState();
+  // KB-261: tracks permission decisions opened during this execute (across
+  // all its queries, including reprompts) so none can still be in flight
+  // when the step result finalizes.
+  const permissionTracker = createPermissionDecisionTracker();
   const abortController = new AbortController();
   const mcpServer = buildOutcomeMcpServer({
     allowedOutcomes,
@@ -595,7 +711,7 @@ async function runExecuteStep(
     abortController,
     systemPrompt: { type: "preset" as const, preset: "claude_code" as const, append: systemPromptAppend },
     cwd,
-    canUseTool: buildCanUseTool(helpers),
+    canUseTool: buildCanUseTool(helpers, permissionTracker),
     allowedTools: [
       `mcp__${mcpServer.name}__${SUBMIT_OUTCOME_TOOL_NAME}`,
       `mcp__${mcpServer.name}__${ADAPTER_TOOL_TOOL_NAME}`,
@@ -690,6 +806,15 @@ async function runExecuteStep(
 
   if (timeoutHandle) {
     clearTimeout(timeoutHandle);
+  }
+
+  // KB-261 ruling addendum: guarantee NO permission decision is still in
+  // flight when the step result finalizes. Drain the bridge deterministically
+  // here, bounded; stragglers past the bound make the step fail typed via
+  // resolveOutcome (no assertion weakening, no tolerant fallback).
+  const unresolvedPermissionTools = await quiescePermissionDecisions(permissionTracker, helpers);
+  if (unresolvedPermissionTools.length > 0) {
+    outcomeState.permissionUnresolvedTools = unresolvedPermissionTools;
   }
 
   const resolved = await resolveOutcome({
