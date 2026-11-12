@@ -192,6 +192,220 @@ export function mockClaudeSdk(queryFactory?: (opts: any) => AsyncIterable<any>) 
 }
 
 /**
+ * The KB-261 layer-2 permission-request routing contract, implemented for the
+ * deterministic harness. One host owns ONE live Permissions consumer; every
+ * permission.request observed on the Execute wire is correlated to that
+ * consumer BY requestId and routed exactly once. Decisions are released by
+ * explicit test control or in arrival order — never by a timer, whose queue
+ * under runner load is what raced the step turn (the delayed-grants flake).
+ *
+ * A request that cannot be correlated (no requestId), is routed twice, or
+ * whose decision would be delivered on a dead/stale consumer is recorded as a
+ * typed routing defect and fails closed — it is never silently re-granted.
+ */
+export class PermissionRequestRouter {
+  private readonly permStream: any;
+  private routes: Array<{ requestId: string; sequence: number; payload: Record<string, any> }> = [];
+  private readonly routedIds = new Set<string>();
+  private grants: Array<{ requestId: string; sequence: number; kind: "allow" | "deny" }> = [];
+  private readonly defectLog: string[] = [];
+  private deadReason: string | null = null;
+  private pendingWaits: Array<{ needed: number; resolve: () => void }> = [];
+
+  private constructor(permStream: any) {
+    this.permStream = permStream;
+    // The router is the single handled consumer of its Permissions stream:
+    // acknowledges are observed here (real consumption, no no-op sinks), and
+    // stream death is captured so a later delivery is a typed defect.
+    this.permStream.on("data", (evt: any) => {
+      if (evt?.acknowledge?.requestId) {
+        // Server acknowledged the decision we delivered (allow/deny).
+      }
+    });
+    this.permStream.on("error", (err: any) => {
+      this.deadReason = String(err ?? "Permissions consumer died");
+    });
+  }
+
+  /**
+   * Return the host's single persistent Permissions consumer, opening it once
+   * on first use. A second concurrent consumer would be a multiplexing
+   * defect, so acquisition is idempotent per host.
+   */
+  static acquire(host: TestHost): PermissionRequestRouter {
+    const anyHost = host as any;
+    if (anyHost._permissionRouter) return anyHost._permissionRouter as PermissionRequestRouter;
+    if (!anyHost.client || !anyHost.sessionId) throw new Error("Host not started or session not open");
+    const router = new PermissionRequestRouter((anyHost.client as any).Permissions());
+    anyHost._permissionRouter = router;
+    anyHost._permStream = router.permStream;
+    return router;
+  }
+
+  get stream() {
+    return this.permStream;
+  }
+
+  /**
+   * Correlate one permission.request observed on the wire. Exactly-once by
+   * requestId: a duplicate routing is recorded as a defect and is NOT
+   * delivered again.
+   */
+  route(requestId: string | undefined, payload: Record<string, any>): void {
+    if (!requestId) {
+      this.defectLog.push("permission.request observed without a requestId (uncorrelatable)");
+      return;
+    }
+    if (this.routedIds.has(requestId)) {
+      this.defectLog.push(`permission.request ${requestId} routed more than once`);
+      return;
+    }
+    this.routedIds.add(requestId);
+    const sequence = this.routes.length + 1;
+    this.routes.push({ requestId, sequence, payload });
+    this.pendingWaits = this.pendingWaits.filter((w) => {
+      if (this.routes.length >= w.needed) {
+        w.resolve();
+        return false;
+      }
+      return true;
+    });
+  }
+
+  /** Resolve when count requests have been routed (event-driven; no polling). */
+  waitRouted(count: number): Promise<void> {
+    if (this.routes.length >= count) return Promise.resolve();
+    return new Promise((resolve) => this.pendingWaits.push({ needed: count, resolve }));
+  }
+
+  /**
+   * Release a decision for the nth (1-based) routed request: an allow by
+   * default, or a deny with `deny_reason`. Delivery to a stale consumer or a
+   * second decision for an already-resolved request fails closed as a typed
+   * defect instead of silently writing into the stream.
+   */
+  grant(n: number, opts?: { deny_reason?: string }): void {
+    const entry = this.routes[n - 1];
+    if (!entry) {
+      this.defectLog.push(`grant(${n}) targets an uncorrelated request`);
+      return;
+    }
+    if (this.deadReason !== null) {
+      this.defectLog.push(`grant(${n}) for ${entry.requestId} would deliver to a stale consumer (${this.deadReason})`);
+      return;
+    }
+    if (this.grants.some((g) => g.requestId === entry.requestId)) {
+      this.defectLog.push(`grant(${n}) issues a second decision for already-resolved ${entry.requestId}`);
+      return;
+    }
+    if (opts?.deny_reason !== undefined) {
+      this.permStream.write({ cancel: { requestId: entry.requestId, reason: opts.deny_reason } });
+      this.grants.push({ requestId: entry.requestId, sequence: entry.sequence, kind: "deny" });
+    } else {
+      this.permStream.write({ request: { requestId: entry.requestId } });
+      this.grants.push({ requestId: entry.requestId, sequence: entry.sequence, kind: "allow" });
+    }
+  }
+
+  /** Release every routed-but-unresolved decision in arrival order (event-driven auto-grant). */
+  grantAllArrived(): void {
+    for (let n = 1; n <= this.routes.length; n++) {
+      const entry = this.routes[n - 1];
+      if (!this.grants.some((g) => g.requestId === entry.requestId)) this.grant(n);
+    }
+  }
+
+  routedCount(): number {
+    return this.routes.length;
+  }
+
+  grantedCount(): number {
+    return this.grants.length;
+  }
+
+  /** Decision-release order, expressed as routed-arrival sequence numbers. */
+  grantedSequences(): number[] {
+    return this.grants.map((g) => g.sequence);
+  }
+
+  routedSequences(): number[] {
+    return this.routes.map((r) => r.sequence);
+  }
+
+  defects(): readonly string[] {
+    return this.defectLog;
+  }
+
+  /** Typed reason if the single consumer died mid-step (routing cannot continue). */
+  consumerDeath(): string | null {
+    return this.deadReason;
+  }
+}
+
+/**
+ * Execute a step through a TestHost with permission decisions released by
+ * routing control instead of timers. Every permission.request is correlated to
+ * the host's single Permissions consumer by requestId before any decision is
+ * written, which makes strict ordering scenarios (delayed grants, parallel
+ * bursts) a construction of the routing contract rather than a timer race.
+ *
+ * `grantOnRoute` releases each decision the moment its request is routed, in
+ * arrival order (event-driven auto-grant). Without it, the caller releases
+ * decisions explicitly via `router.grant(n)` — e.g. after `router.waitRouted`.
+ */
+export async function executeWithPermissionRouter(
+  host: TestHost,
+  opts: {
+    stepName: string;
+    input?: Record<string, unknown>;
+    allowedOutcomes?: string[];
+    router?: PermissionRequestRouter;
+    /** Release each routed decision immediately, in arrival order (event-driven auto-grant). */
+    grantOnRoute?: boolean;
+  }
+): Promise<{ outcome: string; outputs: Record<string, string>; router: PermissionRequestRouter }> {
+  const client = (host as any).client;
+  const sessionId = (host as any).sessionId;
+  if (!client || !sessionId) throw new Error("Host not started or session not open");
+
+  const router = opts.router ?? PermissionRequestRouter.acquire(host);
+
+  const result: any = await new Promise((resolve, reject) => {
+    let resolved = false;
+    const execStream = (client as any).Execute({
+      sessionId,
+      stepName: opts.stepName,
+      input: opts.input ?? {},
+      allowedOutcomes: opts.allowedOutcomes ?? [],
+    });
+
+    execStream.on("data", (evt: any) => {
+      if (resolved) return;
+      if (evt.result) {
+        resolved = true;
+        resolve(evt.result);
+        return;
+      }
+      const adapterEvt = evt.adapter as Record<string, unknown> | undefined;
+      if (adapterEvt?.eventKind !== "permission.request") return;
+      const payload = parsePermissionPayload(adapterEvt.payload as any);
+      const reqId =
+        (payload?.requestId as string | undefined) ?? (payload?.request_id as string | undefined);
+      router.route(reqId, payload);
+      if (opts.grantOnRoute) router.grantAllArrived();
+    });
+    execStream.on("error", (err: any) => {
+      if (!resolved) reject(err);
+    });
+    execStream.on("end", () => {
+      if (!resolved) reject(new Error("Execute stream ended without result"));
+    });
+  });
+
+  return { outcome: result.outcome ?? "", outputs: decodeOutputs(result), router };
+}
+
+/**
  * Execute a step through a TestHost and return the full outputs map exposed by
  * the wire result event. TestHost only exposes `reason` on its friendly return
  * value, so we talk to the underlying gRPC client to capture the exact key set.
@@ -215,9 +429,17 @@ export async function executeWithOutputs(
   const autoGrant = (host as any)._autoGrantPermissions ?? false;
   const delayMs = (host as any)._permissionDelayMs ?? 0;
   if (!client || !sessionId) throw new Error("Host not started or session not open");
+  if (autoGrant && delayMs > 0) {
+    // Timer-queued grants race the step turn under runner load (the KB-261
+    // delayed-grants flake). Controlled release must go through the router.
+    throw new Error(
+      "permissionDelayMs with executeWithOutputs is unsupported: timer-queued permission grants race the step turn; use PermissionRequestRouter for controlled, event-driven release"
+    );
+  }
 
-  const permStream = (host as any)._permStream ?? (client as any).Permissions();
-  (host as any)._permStream = permStream;
+  // All permission decisions route through the single requestId-correlated
+  // consumer (KB-261 layer-2 routing contract).
+  const router = PermissionRequestRouter.acquire(host);
 
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -256,13 +478,8 @@ export async function executeWithOutputs(
           const reqId =
             (payload?.requestId as string | undefined) ??
             (payload?.request_id as string | undefined);
-          if (reqId && autoGrant) {
-            if (delayMs > 0) {
-              setTimeout(() => permStream.write({ request: { requestId: reqId } }), delayMs);
-            } else {
-              permStream.write({ request: { requestId: reqId } });
-            }
-          }
+          router.route(reqId, payload);
+          if (autoGrant) router.grantAllArrived();
         } else {
           adapterEvents.push({ kind, payload });
         }
@@ -275,8 +492,6 @@ export async function executeWithOutputs(
     execStream.on("end", () => {
       if (!resolved) reject(new Error("Execute stream ended without result"));
     });
-    permStream.on("data", () => {});
-    permStream.on("error", () => {});
   });
 
   // Give buffered log lines a moment to drain through the Log stream.
@@ -309,8 +524,10 @@ export async function executeWithManualPermission(
   const sessionId = (host as any).sessionId;
   if (!client || !sessionId) throw new Error("Host not started or session not open");
 
-  const permStream = (host as any)._permStream ?? (client as any).Permissions();
-  (host as any)._permStream = permStream;
+  const router = PermissionRequestRouter.acquire(host);
+  // Decision writes stay caller-controlled (no timers); observed requests are
+  // correlated by requestId through the single consumer.
+  const permStream = router.stream;
 
   const result: any = await new Promise((resolve, reject) => {
     let resolved = false;
@@ -336,6 +553,7 @@ export async function executeWithManualPermission(
         const reqId =
           payload?.fields?.requestId?.stringValue ??
           payload?.fields?.request_id?.stringValue;
+        router.route(reqId, parsePermissionPayload(payload));
         if (reqId) opts.onRequest(reqId, permStream, payload);
       }
     });
@@ -346,8 +564,6 @@ export async function executeWithManualPermission(
     execStream.on("end", () => {
       if (!resolved) reject(new Error("Execute stream ended without result"));
     });
-    permStream.on("data", () => {});
-    permStream.on("error", () => {});
   });
 
   return { outcome: result.outcome ?? "", outputs: decodeOutputs(result) };

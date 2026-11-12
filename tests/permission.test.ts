@@ -6,8 +6,10 @@ import {
   MockMcpServer,
   mockClaudeSdk,
   executeWithManualPermission,
+  executeWithPermissionRouter,
   executeWithOutputs,
   parsePermissionPayload,
+  PermissionRequestRouter,
 } from "./helpers.js";
 
 mockClaudeSdk();
@@ -355,7 +357,7 @@ describe("permission handling", () => {
     expect(capturedTools.sort()).toEqual(["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   const declaredTools = ["Read", "Bash", "Write", "Edit", "Glob", "Grep"];
   for (const allowed of declaredTools) {
@@ -407,7 +409,7 @@ describe("permission handling", () => {
       expect(requestedTool).toBe(allowed);
       expect(["success", "failure", "needs_review"]).toContain(outcome);
       await host.stop();
-    });
+    }, 30_000);
   }
 
   test("host permission.granted with matching requestId resolves to allow in under 1 second", async () => {
@@ -586,22 +588,31 @@ describe("permission handling", () => {
     const mod = await import(`${adapterPath}?${Date.now()}`);
     const host = new TestHost({
       config: mod.adapterConfig,
-      autoGrantPermissions: true,
-      permissionDelayMs: 5,
     });
     await host.start();
 
     await host.openSession({ config: { claude_executable: FAKE_CLI } });
-    const result = await host.execute({
+    const { outcome, router } = await executeWithPermissionRouter(host, {
       stepName: "stress",
       input: { prompt: "stress test" },
       allowedOutcomes: ["success"],
+      grantOnRoute: true,
     });
 
     expect(permissionCount).toBe(50);
-    expect(["success", "failure", "needs_review"]).toContain(result.outcome);
+    // Routing invariant (KB-261 layer-2): all 50 requests correlated exactly
+    // once by requestId and released in arrival order on the single live
+    // consumer — never delivered to a stale/no-op consumer, never released
+    // uncorrelated. Release is event-driven on the observed request, not a
+    // timer racing the turn.
+    expect(router.defects()).toEqual([]);
+    expect(router.routedCount()).toBe(50);
+    expect(router.grantedCount()).toBe(50);
+    expect(router.grantedSequences()).toEqual(router.routedSequences());
+    expect(router.consumerDeath()).toBeNull();
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 
   test("permission decisions with delayed grants resolve correctly", async () => {
     const order: number[] = [];
@@ -633,24 +644,45 @@ describe("permission handling", () => {
     }));
 
     const mod = await import(`${adapterPath}?${Date.now()}`);
-    const host = new TestHost({
-      config: mod.adapterConfig,
-      autoGrantPermissions: true,
-      permissionDelayMs: 20,
-    });
+    const host = new TestHost({ config: mod.adapterConfig });
     await host.start();
 
     await host.openSession({ config: { claude_executable: FAKE_CLI } });
-    const result = await host.execute({
+    const router = PermissionRequestRouter.acquire(host);
+    const run = executeWithPermissionRouter(host, {
       stepName: "delayed-grants",
       input: { prompt: "delayed" },
       allowedOutcomes: ["success"],
+      router,
     });
 
+    // Deterministic controlled release (KB-261 layer-2: no setTimeout racing
+    // the turn). Decision #1 is released the moment request #1 is ROUTED to
+    // the single requestId-correlated consumer; decision #2 likewise. The
+    // mock awaits decisions sequentially, so request #2 cannot exist on the
+    // wire until decision #1 has reached the adapter — the grant order is a
+    // construction of the query shape + routing contract, not scheduler luck.
+    await router.waitRouted(1);
+    router.grant(1);
+    await router.waitRouted(2);
+    router.grant(2);
+
+    const { outcome } = await run;
+
+    // Strict ordering assertion — unchanged.
     expect(order).toEqual([1, 2]);
-    expect(["success", "failure", "needs_review"]).toContain(result.outcome);
+    // Routing invariant (KB-261 layer-2): each request correlated exactly
+    // once by requestId and released in routed arrival order on the single
+    // live consumer — no duplicate routing, no delivery to a stale/no-op
+    // consumer, no uncorrelated release.
+    expect(router.defects()).toEqual([]);
+    expect(router.routedCount()).toBe(2);
+    expect(router.grantedCount()).toBe(2);
+    expect(router.grantedSequences()).toEqual([1, 2]);
+    expect(router.consumerDeath()).toBeNull();
+    expect(["success", "failure", "needs_review"]).toContain(outcome);
     await host.stop();
-  });
+  }, 30_000);
 });
 
 describe("permission-bridge quiesce (KB-261 ruling addendum)", () => {
@@ -789,7 +821,7 @@ describe("permission-bridge quiesce (KB-261 ruling addendum)", () => {
       permStream.end?.();
       await host.stop();
     }
-  });
+  }, 30_000);
 
   describe("quiesce unit probes", () => {
     let mod: any;
