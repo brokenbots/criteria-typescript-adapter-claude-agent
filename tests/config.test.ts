@@ -5,6 +5,7 @@ import {
   FAKE_CLI,
   MockMcpServer,
   mockClaudeSdk,
+  shutdownTestHost,
 } from "./helpers.js";
 
 mockClaudeSdk();
@@ -32,7 +33,7 @@ describe("config and secrets", () => {
       await host.start();
       await host.openSession({ config: { reasoning_effort: effort, claude_executable: FAKE_CLI } });
       await host.execute({ stepName: `effort-${effort}`, input: { prompt: "test" }, allowedOutcomes: ["success"] });
-      await host.stop();
+      await shutdownTestHost(host);
     }
 
     expect(capturedThinking["none"]).toEqual({ type: "disabled" });
@@ -50,7 +51,7 @@ describe("config and secrets", () => {
       host.openSession({ config: { reasoning_effort: "xhigh", claude_executable: FAKE_CLI } })
     ).rejects.toThrow(/Invalid reasoning_effort/);
 
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("OpenSession rejects invalid model values", async () => {
@@ -66,7 +67,7 @@ describe("config and secrets", () => {
       host.openSession({ config: { model: "claude sonnet", claude_executable: FAKE_CLI } })
     ).rejects.toThrow(/Invalid model/);
 
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("OpenSession trims and accepts valid model", async () => {
@@ -92,7 +93,7 @@ describe("config and secrets", () => {
     await host.execute({ stepName: "model-trim", input: { prompt: "test" }, allowedOutcomes: ["success"] });
 
     expect(capturedModel).toBe("claude-sonnet-4-6");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("OpenSession accepts documented Ollama model names with colons and slashes", async () => {
@@ -126,7 +127,7 @@ describe("config and secrets", () => {
     });
 
     expect(capturedModels).toEqual(["kimi-k2.7-code:cloud", "library/kimi-k2.7-code:cloud"]);
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("per-step model override takes precedence over config model", async () => {
@@ -157,7 +158,7 @@ describe("config and secrets", () => {
     });
 
     expect(capturedModels).toEqual(["config-model", "step-model"]);
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("legacy thinking true maps to reasoning_effort high", async () => {
@@ -183,7 +184,7 @@ describe("config and secrets", () => {
     await host.execute({ stepName: "legacy-thinking", input: { prompt: "test" }, allowedOutcomes: ["success"] });
 
     expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 65536 });
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("legacy thinking false maps to reasoning_effort none", async () => {
@@ -209,7 +210,7 @@ describe("config and secrets", () => {
     await host.execute({ stepName: "legacy-thinking-false", input: { prompt: "test" }, allowedOutcomes: ["success"] });
 
     expect(capturedThinking).toEqual({ type: "disabled" });
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("reasoning_effort takes precedence over legacy thinking", async () => {
@@ -235,7 +236,7 @@ describe("config and secrets", () => {
     await host.execute({ stepName: "effort-wins", input: { prompt: "test" }, allowedOutcomes: ["success"] });
 
     expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 4096 });
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("per-step cwd input overrides config-level cwd", async () => {
@@ -265,7 +266,7 @@ describe("config and secrets", () => {
     });
 
     expect(capturedCwd).toBe("/step-level-cwd");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("config-level cwd is used when input does not override", async () => {
@@ -295,7 +296,7 @@ describe("config and secrets", () => {
     });
 
     expect(capturedCwd).toBe("/config-cwd");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("base_url config is forwarded to the subprocess env", async () => {
@@ -327,7 +328,7 @@ describe("config and secrets", () => {
     });
 
     expect(capturedEnv?.ANTHROPIC_BASE_URL).toBe("https://config.example/v1");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("base_url falls back to the ANTHROPIC_BASE_URL environment variable", async () => {
@@ -360,7 +361,7 @@ describe("config and secrets", () => {
       });
 
       expect(capturedEnv?.ANTHROPIC_BASE_URL).toBe("https://env.example/v1");
-      await host.stop();
+      await shutdownTestHost(host);
     } finally {
       if (previous === undefined) delete process.env.ANTHROPIC_BASE_URL;
       else process.env.ANTHROPIC_BASE_URL = previous;
@@ -382,7 +383,7 @@ describe("config and secrets", () => {
     });
 
     expect(["success", "failure", "needs_review"]).toContain(result.outcome);
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("secrets provided to OpenSession are forwarded to the subprocess env", async () => {
@@ -419,7 +420,7 @@ describe("config and secrets", () => {
 
     expect(capturedEnv?.ANTHROPIC_API_KEY).toBe("sk-ant-api03-test-key");
     expect(capturedEnv?.ANTHROPIC_AUTH_TOKEN).toBe("sk-ant-auth03-test-token");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("subprocess env only receives the declared passthrough set, not arbitrary host env", async () => {
@@ -459,7 +460,7 @@ describe("config and secrets", () => {
       expect(capturedEnv?.HOME).toBe("/home/test");
       expect(capturedEnv).not.toHaveProperty("SOME_RANDOM_HOST_SECRET");
       expect(capturedEnv?.CLAUDE_AGENT_SDK_CLIENT_APP).toContain("criteria-adapter-claude-agent");
-      await host.stop();
+      await shutdownTestHost(host);
     } finally {
       if (previousSecret === undefined) delete process.env.SOME_RANDOM_HOST_SECRET;
       else process.env.SOME_RANDOM_HOST_SECRET = previousSecret;
@@ -506,7 +507,7 @@ describe("config and secrets", () => {
       });
 
       expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe("/tmp/claude-config-dir-session");
-      await host.stop();
+      await shutdownTestHost(host);
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = previous;
@@ -548,7 +549,7 @@ describe("config and secrets", () => {
       });
 
       expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe("/tmp/claude-config-dir-session");
-      await host.stop();
+      await shutdownTestHost(host);
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = previous;
@@ -588,7 +589,7 @@ describe("config and secrets", () => {
       });
 
       expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe("/tmp/claude-config-dir-host-env");
-      await host.stop();
+      await shutdownTestHost(host);
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = previous;
@@ -618,7 +619,7 @@ describe("config and secrets", () => {
     await host.execute({ stepName: "exec", input: { prompt: "test" }, allowedOutcomes: ["success"] });
 
     expect(resolvedExecutable).toBe(FAKE_CLI);
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("execute rejects a non-executable claude_executable configured at openSession", async () => {
@@ -636,7 +637,7 @@ describe("config and secrets", () => {
     expect(caught).toBeDefined();
     expect(caught.message).toMatch(/is not an executable file/);
 
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("system_prompt config is appended to the SDK system prompt", async () => {
@@ -663,7 +664,7 @@ describe("config and secrets", () => {
 
     expect(capturedAppend).toContain("You are a helpful assistant.");
     expect(capturedAppend).toContain("submit_outcome");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("OpenSession rejects invalid step_timeout_ms", async () => {
@@ -675,7 +676,7 @@ describe("config and secrets", () => {
       host.openSession({ config: { step_timeout_ms: -1, claude_executable: FAKE_CLI } })
     ).rejects.toThrow(/Invalid timeout/);
 
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("per-step timeout_ms overrides config step_timeout_ms", async () => {
@@ -715,6 +716,6 @@ describe("config and secrets", () => {
 
     expect(result.outcome).toBe("failure");
     expect(result.reason).toMatch(/timed out|timeout/i);
-    await host.stop();
+    await shutdownTestHost(host);
   });
 });

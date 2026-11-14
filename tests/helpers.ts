@@ -1,5 +1,5 @@
 import { TestHost } from "@criteria/adapter-sdk/testing";
-import { fromProtoStruct } from "../node_modules/@criteria/adapter-sdk/dist/plugin/server-v2.js";
+import { fromProtoStruct, stopServerV2 } from "../node_modules/@criteria/adapter-sdk/dist/plugin/server-v2.js";
 import { mock } from "bun:test";
 import { appendFileSync } from "node:fs";
 
@@ -409,6 +409,25 @@ export class PermissionRequestRouter {
     );
     this.deadReason = this.deadReason ?? "decision delivery failed on the routed consumer";
   }
+
+  /**
+   * Close the harness-owned Permissions stream client-side (an explicit
+   * HTTP/2 reset while the channel is still open). The in-process server then
+   * observes the stream's terminal event NOW — while this host's teardown is
+   * the only live activity and its own pending set is the only thing the
+   * process-wide drain can touch — instead of wherever the transport reap
+   * fires the stale event later, long after stop() returned and a different
+   * test's turn is already holding pending requests (the KB-402 delivery
+   * loss). No further grant() may be released afterwards.
+   */
+  release(): void {
+    try {
+      (this.permStream as any).cancel?.();
+    } catch {
+      /* already closed */
+    }
+    this.deadReason = this.deadReason ?? "Permissions consumer released by test teardown";
+  }
 }
 
 /**
@@ -674,4 +693,83 @@ function decodeOutputs(result: any): Record<string, string> {
  */
 export function parsePermissionPayload(payload: Record<string, any>): Record<string, any> {
   return payload ? fromProtoStruct(payload) : {};
+}
+
+/**
+ * Fully drain and stop a test host with deterministic ordering (KB-402).
+ *
+ * Why not a plain `host.stop()`: the SDK's TestHost.stop() tears the client
+ * channel down WITHOUT per-stream cancels and kicks `stopServerV2` off without
+ * awaiting it, so a stopped test's gRPC server is still closing while the next
+ * test's turn is already live. Under load, the transport reap finally fires
+ * 'cancelled' on the STALE server's Permissions stream ~98-500ms after its
+ * stop — and the SDK's permission drain is process-wide, so that stale
+ * terminal event denies EVERY pending permission in the bun process,
+ * including a different test's in-flight requests. That is the delayed-grants
+ * delivery loss on CI (run 43610080981: request #2 never routed; the stale
+ * drain denied request #1 mid-turn and the mock generator died before it
+ * could emit #2) and the 50-parallel losses (smoking-gun trace: the stale
+ * srv-...#p9 cancel denied all 50 live pendings ~200ms after the burst).
+ *
+ * Ordering contract enforced here, in sequence, before the host is handed
+ * back closed:
+ *
+ *  1. Cancel every harness-opened stream client-side while the channel is
+ *     still open — the harness-owned routed Permissions consumer (whose
+ *     client-side reset lets the in-process server observe its terminal event
+ *     NOW, with an empty pending set) and the SDK-managed permission/log
+ *     streams opened inside TestHost.execute.
+ *  2. Close the client channel.
+ *  3. AWAIT the bounded graceful shutdown: `tryShutdown` resolves only once
+ *     every in-flight call on this server has completed, so a subsequent test
+ *     can never start inside a stale server's closing window.
+ *
+ * This mirrors the SDK's TestHost.stop() teardown sequence (client → server →
+ * child) with the awaits and explicit cancels that version omits; a later
+ * plain `host.stop()` remains a no-op because the fields are cleared as they
+ * are owned. Idempotent.
+ */
+export async function shutdownTestHost(host: TestHost): Promise<void> {
+  const anyHost = host as any;
+  // (1) Explicit client-side cancels while the channel is open.
+  if (anyHost._permissionRouter) {
+    (anyHost._permissionRouter as PermissionRequestRouter).release();
+    anyHost._permissionRouter = undefined;
+    anyHost._permStream = undefined;
+  }
+  anyHost.cancelLogStream?.();
+  anyHost.cancelPermissionsStream?.();
+
+  // (2) Close the client channel (same field hygiene as TestHost.stop()).
+  if (anyHost.client) {
+    const client = anyHost.client;
+    anyHost.client = undefined;
+    try {
+      client.close();
+    } catch {
+      /* already closed */
+    }
+  }
+
+  // (3) Await the bounded graceful shutdown of the in-process server.
+  if (anyHost.server) {
+    const server = anyHost.server;
+    anyHost.server = undefined;
+    try {
+      await stopServerV2(server);
+    } catch {
+      /* shutdown is bounded (3s) and best-effort; nothing to propagate */
+    }
+  }
+
+  // Child-mode hosts (spawned adapter process), same as TestHost.stop().
+  if (anyHost.child) {
+    const child = anyHost.child;
+    anyHost.child = undefined;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* process already gone */
+    }
+  }
 }

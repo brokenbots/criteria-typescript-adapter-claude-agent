@@ -5,6 +5,7 @@ import {
   FAKE_CLI,
   MockMcpServer,
   mockClaudeSdk,
+  shutdownTestHost,
 } from "./helpers.js";
 
 mockClaudeSdk();
@@ -27,7 +28,7 @@ describe("session management", () => {
     expect(["success", "failure", "needs_review"].includes(result.outcome)).toBe(true);
 
     await host.closeSession();
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("snapshot and restore preserve session state", async () => {
@@ -56,7 +57,7 @@ describe("session management", () => {
 
     const snap2 = await host.snapshot();
     expect(snap2.state).toBeDefined();
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("snapshot and restore preserve claude_executable", async () => {
@@ -102,7 +103,7 @@ describe("session management", () => {
     });
 
     expect(resolvedExecutable).toBe(FAKE_CLI);
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("session persists cwd and model across execute calls", async () => {
@@ -137,7 +138,7 @@ describe("session management", () => {
     expect(captured[0].model).toBe("session-model");
     expect(captured[1].cwd).toBe("/session-cwd");
     expect(captured[1].model).toBe("session-model");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("snapshot and restore preserve cwd and model", async () => {
@@ -174,7 +175,7 @@ describe("session management", () => {
 
     expect(captured[1].cwd).toBe("/snap-cwd");
     expect(captured[1].model).toBe("snap-model");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("snapshot and restore preserve reasoning_effort", async () => {
@@ -208,7 +209,7 @@ describe("session management", () => {
     await host.execute({ stepName: "after-restore", input: { prompt: "test" }, allowedOutcomes: ["success"] });
     expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 16384 });
 
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("legacy thinking boolean snapshot is migrated to reasoning_effort on restore", async () => {
@@ -248,7 +249,7 @@ describe("session management", () => {
     await host.execute({ stepName: "migrated", input: { prompt: "test" }, allowedOutcomes: ["success"] });
     expect(capturedThinking).toEqual({ type: "enabled", budgetTokens: 65536 });
 
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("session resumes from persisted claudeSessionId across execute calls", async () => {
@@ -290,6 +291,6 @@ describe("session management", () => {
     expect(firstExecuteResumes[0]).toBeUndefined();
     expect(firstExecuteResumes[1]).toBe("persisted-session");
     expect(secondExecuteResumes[0]).toBe("persisted-session");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 });

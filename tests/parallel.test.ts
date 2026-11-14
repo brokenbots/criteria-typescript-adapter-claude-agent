@@ -4,6 +4,7 @@ import {
   adapterPath,
   FAKE_CLI,
   MockMcpServer,
+  shutdownTestHost,
 } from "./helpers.js";
 
 /**
@@ -165,7 +166,7 @@ describe("parallel_safe gate contract (CRI-301)", () => {
     expect(capabilities).toContain("parallel_safe");
     // Multi-turn remains declared: reprompt loop still applies per iteration.
     expect(capabilities).toContain("multi_turn");
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("adapterConfig.capabilities is the source of the Info() declaration", async () => {
@@ -252,7 +253,7 @@ describe("concurrent execute isolation (CRI-301)", () => {
     expect(resumeLog.get("B")).toEqual(["<none>", "claude-B"]);
 
     await host.closeSession();
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("concurrent in-flight permission requests are correlated per requestId", async () => {
@@ -351,7 +352,7 @@ describe("concurrent execute isolation (CRI-301)", () => {
       // ignore close errors
     }
     await host.closeSession();
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("concurrent executes with per-step overrides do not share option state", async () => {
@@ -427,7 +428,7 @@ describe("concurrent execute isolation (CRI-301)", () => {
     expect(byMarker.get("A")?.envKey).toBe("/isolated-config-dir-A");
     expect(byMarker.get("B")?.envKey).toBe("/isolated-config-dir-B");
     await host.closeSession();
-    await host.stop();
+    await shutdownTestHost(host);
   });
 });
 
@@ -564,7 +565,7 @@ describe("concurrent executes on one session (CRI-306)", () => {
     expect(queries[3]).toEqual({ marker: "after", resume: "claude-owner" });
 
     await host.closeSession();
-    await host.stop();
+    await shutdownTestHost(host);
   });
 
   test("reprompt attempts follow the same per-execute conversation for owner and sibling", async () => {
@@ -641,6 +642,6 @@ describe("concurrent executes on one session (CRI-306)", () => {
     expect(byMarker.get("sibling")).toEqual([undefined, "claude-sibling", "claude-sibling"]);
 
     await host.closeSession();
-    await host.stop();
+    await shutdownTestHost(host);
   });
 });
