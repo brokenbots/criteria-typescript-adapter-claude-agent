@@ -221,6 +221,12 @@ export class PermissionRequestRouter {
   private readonly defectLog: string[] = [];
   private deadReason: string | null = null;
   private pendingWaits: Array<{ needed: number; resolve: () => void }> = [];
+  // Intentional-close state: set once close() half-closes the Permissions
+  // stream, so errors racing the teardown (a later channel close touching the
+  // already-ended call) are not misrecorded as consumer death.
+  private closedStream = false;
+  private endObserved = false;
+  private endBarrier: Promise<void> | null = null;
 
   static trace(tag: string, detail?: unknown): void {
     const path = process.env.PERM_ROUTER_TRACE;
@@ -250,7 +256,18 @@ export class PermissionRequestRouter {
         // Server acknowledged the decision we delivered (allow/deny).
       }
     });
+    this.permStream.on("end", () => {
+      this.endObserved = true;
+      PermissionRequestRouter.trace("permStream.end", {});
+    });
     this.permStream.on("error", (err: any) => {
+      if (this.closedStream) {
+        // The teardown barrier already half-closed this stream; an error
+        // racing the orderly close (or later fired by host.stop()) is the
+        // closed call itself, not a mid-step consumer death.
+        PermissionRequestRouter.trace("permStream.error.afterClose", { err: String(err) });
+        return;
+      }
       this.deadReason = String(err ?? "Permissions consumer died");
       PermissionRequestRouter.trace("permStream.error", { deadReason: this.deadReason });
     });
@@ -271,8 +288,76 @@ export class PermissionRequestRouter {
     return router;
   }
 
+  /**
+   * The host's acquired router, if this host ever opened a Permissions
+   * stream. Read-only introspection: never opens a stream and never mutates
+   * host state (contrast with {@link PermissionRequestRouter.acquire}).
+   */
+  static forHost(host: TestHost): PermissionRequestRouter | undefined {
+    return (host as any)?._permissionRouter as PermissionRequestRouter | undefined;
+  }
+
   get stream() {
     return this.permStream;
+  }
+
+  /**
+   * Deterministic teardown barrier (KB-401 CI regression): half-close the
+   * Permissions stream and resolve only after the client observes the
+   * stream's orderly 'end'. The SDK server's Permissions handler runs its
+   * deny-drain of every pending permission BEFORE it ends its side of the
+   * call, so an observed 'end' is the proof the drain — which, in
+   * adapter-sdk 0.5.6, iterates the process-global session registry — has
+   * already completed. A bare host.stop() instead cancels the call at an
+   * uncontrolled time, and the resulting late drain can land inside a later
+   * host's pending-permission window and resolve it as a deny decision.
+   *
+   * Liveness: the barrier also settles on 'close'/'error', tolerates an
+   * already-ended, already-errored or already-cancelled stream, and repeated
+   * calls are idempotent (same barrier). Errors arriving after the
+   * intentional close are recorded as neither deliver defects nor consumer
+   * death — consumerDeath() and defects() stay clean across a proper
+   * teardown, including when host.stop() later cancels the ended stream.
+   */
+  async close(): Promise<void> {
+    if (this.endBarrier) return this.endBarrier;
+    const stream = this.permStream as any;
+    this.closedStream = true;
+    this.endBarrier = new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = (how: string) => {
+        if (settled) return;
+        settled = true;
+        PermissionRequestRouter.trace("permStream.close.settled", { how });
+        resolve();
+      };
+      stream.on("end", () => settle("end"));
+      stream.on("close", () => settle("close"));
+      stream.on("error", () => settle("error"));
+      if (
+        this.endObserved ||
+        this.deadReason !== null ||
+        stream.writableEnded === true ||
+        stream.destroyed === true
+      ) {
+        // The call is already over (orderly end or a real death): the
+        // corresponding server-side drain has already run for it.
+        PermissionRequestRouter.trace("permStream.close.alreadyFinished", {});
+        settle("already-finished");
+        return;
+      }
+      try {
+        stream.end();
+      } catch (err) {
+        PermissionRequestRouter.trace("permStream.close.endFailed", { err: String(err) });
+      }
+    });
+    return this.endBarrier;
+  }
+
+  /** Whether the stream observed an orderly server-side end (teardown-barrier test evidence). */
+  streamEnded(): boolean {
+    return this.endObserved;
   }
 
   /**
@@ -409,6 +494,22 @@ export class PermissionRequestRouter {
     );
     this.deadReason = this.deadReason ?? "decision delivery failed on the routed consumer";
   }
+}
+
+/**
+ * Deterministic teardown for router-backed hosts (KB-401 CI regression):
+ * half-close the host's Permissions stream and wait for the server-side drain
+ * to complete BEFORE stopping the host, confining the deny-drain to the test
+ * that owns the stream. Without the barrier, a bare host.stop() tears the
+ * stream down at an uncontrolled time and the SDK's process-global
+ * permissions drain can resolve a later host's in-flight permission request
+ * as a deny decision. Hosts without an acquired router (raw-stream hosts that
+ * manage their own Permissions stream) tear down exactly as before.
+ */
+export async function stopHost(host: TestHost): Promise<void> {
+  const router = PermissionRequestRouter.forHost(host);
+  if (router) await router.close();
+  await host.stop();
 }
 
 /**

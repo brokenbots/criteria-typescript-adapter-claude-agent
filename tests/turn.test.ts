@@ -7,6 +7,7 @@ import {
   MockQuery,
   mockClaudeSdk,
   executeWithOutputs,
+  stopHost,
 } from "./helpers.js";
 
 mockClaudeSdk();
@@ -39,7 +40,7 @@ describe("turn execution", () => {
     expect(capturedPrompt).toBe("Do the thing");
     expect(capturedAppend).toContain("Custom system prompt.");
     expect(capturedAppend).toContain("submit_outcome");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("tool invocation bridge is wired for every allowed runtime tool", async () => {
@@ -75,7 +76,7 @@ describe("turn execution", () => {
     await host.execute({ stepName: "bridge", input: { prompt: "use tools" }, allowedOutcomes: ["success"] });
 
     expect(bridgedTools).toEqual(["Bash", "Read", "Write"]);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("assistant message blocks are emitted as adapter events", async () => {
@@ -112,7 +113,7 @@ describe("turn execution", () => {
 
     expect(events.adapterEvents.some((e) => e.kind === "agent.message" && e.payload.content === "Hello, ")).toBe(true);
     expect(events.adapterEvents.some((e) => e.kind === "agent.message" && e.payload.content === "world.")).toBe(true);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("stream_event text deltas are written to stdout", async () => {
@@ -147,7 +148,7 @@ describe("turn execution", () => {
     });
 
     expect(events.stdout.join("")).toContain("streaming text");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("tool_progress events are logged to stdout and emitted as adapter events", async () => {
@@ -176,7 +177,7 @@ describe("turn execution", () => {
 
     expect(events.stdout.some((s) => s.includes("[Bash]") && s.includes("running..."))).toBe(true);
     expect(events.adapterEvents.some((e) => e.kind === "tool.progress" && e.payload.tool === "Bash")).toBe(true);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("result success emits query.complete adapter event with metadata", async () => {
@@ -207,7 +208,7 @@ describe("turn execution", () => {
     expect(complete.payload.durationMs).toBe(250);
     expect(complete.payload.turns).toBe(3);
     expect(complete.payload.costUsd).toBe(0.42);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("result error emits query.error adapter event and logs stderr", async () => {
@@ -239,7 +240,7 @@ describe("turn execution", () => {
     expect(errorEvt.payload.subtype).toBe("error");
     expect(errorEvt.payload.errors).toContain("Claude refused the request");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("auth_status event logs authentication state to stdout", async () => {
@@ -267,7 +268,7 @@ describe("turn execution", () => {
     });
 
     expect(events.stdout.some((s) => s.includes("Authenticating"))).toBe(true);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("general query error before finalizing yields a failure outcome", async () => {
@@ -292,7 +293,7 @@ describe("turn execution", () => {
     expect(result.outcome).toBe("failure");
     expect(result.reason).toContain("Agent query failed");
     expect(result.reason).toContain("simulated agent crash");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("query error after timeout does not overwrite the timed-out state", async () => {
@@ -328,7 +329,7 @@ describe("turn execution", () => {
     expect(result.outcome).toBe("failure");
     expect(result.reason).toMatch(/timed out|timeout/i);
     expect(result.reason).not.toContain("Agent query failed");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("reprompt loop resumes from the persisted session id", async () => {
@@ -353,6 +354,6 @@ describe("turn execution", () => {
 
     expect(result.outcome).toBe("failure");
     expect(result.reason).toContain("after 1 finalize attempt");
-    await host.stop();
+    await stopHost(host);
   });
 });
