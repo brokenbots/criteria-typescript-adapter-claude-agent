@@ -10,6 +10,7 @@ import {
   executeWithOutputs,
   parsePermissionPayload,
   PermissionRequestRouter,
+  stopHost,
 } from "./helpers.js";
 
 mockClaudeSdk();
@@ -58,7 +59,7 @@ describe("permission handling", () => {
     expect(capturedId).toBeDefined();
     expect(capturedId?.length).toBeGreaterThan(0);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("permission bridge forwards tool name and args to the host", async () => {
@@ -105,7 +106,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.tool).toBe("Read");
     expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ path: "/tmp/readme.md" }));
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("CRI-31: permission.request payload carries the Bash command digest and preview", async () => {
@@ -156,7 +157,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ command: commandText }));
     expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("CRI-31: commands array is carried in the args digest and preview", async () => {
@@ -205,7 +206,7 @@ describe("permission handling", () => {
     expect(capturedPayload?.argsPreview).toBe(JSON.stringify({ commands }));
     expect(capturedPayload?.argsDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("CRI-31: non-command tool args are digested and previewed without command shapes", async () => {
@@ -255,7 +256,7 @@ describe("permission handling", () => {
     expect(capturedPayload).not.toHaveProperty("full_command_text");
     expect(capturedPayload).not.toHaveProperty("commands");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("CRI-31: bare allow_tools = ['Bash'] still grants without fingerprint", async () => {
@@ -300,7 +301,7 @@ describe("permission handling", () => {
 
     expect(capturedBehavior).toBe("allow");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("CRI-32: declared permissions match runtime SDK tool names", async () => {
@@ -356,7 +357,7 @@ describe("permission handling", () => {
 
     expect(capturedTools.sort()).toEqual(["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   const declaredTools = ["Read", "Bash", "Write", "Edit", "Glob", "Grep"];
@@ -408,7 +409,7 @@ describe("permission handling", () => {
 
       expect(requestedTool).toBe(allowed);
       expect(["success", "failure", "needs_review"]).toContain(outcome);
-      await host.stop();
+      await stopHost(host);
     }, 30_000);
   }
 
@@ -457,7 +458,7 @@ describe("permission handling", () => {
     expect(canUseToolEnd).toBeGreaterThan(0);
     expect(canUseToolEnd - canUseToolStart).toBeLessThan(1000);
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("host permission.denied with matching requestId resolves to deny in under 1 second", async () => {
@@ -507,7 +508,7 @@ describe("permission handling", () => {
     expect(canUseToolEnd - canUseToolStart).toBeLessThan(1000);
     expect(capturedBehavior).toBe("deny");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("denied permission returns the host reason in the SDK response", async () => {
@@ -551,7 +552,7 @@ describe("permission handling", () => {
 
     expect(capturedMessage).toBe("Too risky for this host");
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("concurrent permission stress test — 50 parallel requests", async () => {
@@ -611,7 +612,7 @@ describe("permission handling", () => {
     expect(router.grantedSequences()).toEqual(router.routedSequences());
     expect(router.consumerDeath()).toBeNull();
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("permission decisions with delayed grants resolve correctly", async () => {
@@ -681,7 +682,121 @@ describe("permission handling", () => {
     expect(router.grantedSequences()).toEqual([1, 2]);
     expect(router.consumerDeath()).toBeNull();
     expect(["success", "failure", "needs_review"]).toContain(outcome);
-    await host.stop();
+    await stopHost(host);
+  }, 30_000);
+
+  // KB-401 CI regression: adapter-sdk 0.5.6 keeps its session registry in a
+  // process-global map and its Permissions handler drains EVERY session's
+  // pending permission as a deny decision whenever ANY Permissions call ends,
+  // errors or is cancelled. A bare host.stop() therefore tears the stream
+  // down at an uncontrolled time, and a prior test's late deny-drain landed
+  // inside this delayed-grants window: request #1 resolved as
+  // `{ behavior: "deny", message: "Permissions stream closed" }`, request #2
+  // was never issued, and waitRouted(2) masked the cause as a 15s timeout.
+  // The fix is harness-side: stopHost() half-closes the stream and waits for
+  // the server's observed 'end' — the point by which the drain has already
+  // run — confining each Permissions stream drain to the test that owns it.
+  test("teardown barrier ends each router's Permissions stream drain within its own test", async () => {
+    // Host A: a fully routed step released event-driven, then torn down
+    // through the barrier helper.
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            const rA = await canUseTool("Read", { path: "/tmp/barrier-a" }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-a",
+            });
+            expect(rA.behavior).toBe("allow");
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const modA = await import(`${adapterPath}?perm-barrier-a-${Date.now()}`);
+    const hostA = new TestHost({ config: modA.adapterConfig, autoGrantPermissions: false });
+    await hostA.start();
+    await hostA.openSession({ config: { claude_executable: FAKE_CLI } });
+    const routerA = PermissionRequestRouter.acquire(hostA);
+    const { outcome: outcomeA } = await executeWithPermissionRouter(hostA, {
+      stepName: "barrier-a",
+      input: { prompt: "barrier host a" },
+      allowedOutcomes: ["success"],
+      router: routerA,
+      grantOnRoute: true,
+    });
+    expect(["success", "failure", "needs_review"]).toContain(outcomeA);
+
+    // The barrier: stopHost must not return until A's Permissions call was
+    // half-closed AND the server ended its side — proof the deny-drain that
+    // runs on call end already completed for A (not a client-only cancel).
+    await stopHost(hostA);
+    expect(routerA.streamEnded()).toBe(true);
+    expect(routerA.consumerDeath()).toBeNull();
+    expect(routerA.defects()).toEqual([]);
+
+    // Host B: a fresh server/session AFTER A is fully torn down. With the
+    // pre-fix teardown, A's late drain resolved B's still-pending decision as
+    // a deny with "Permissions stream closed" and the pending request never
+    // received the explicit release — exactly the CI symptom.
+    const decisions: string[] = [];
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (opts: any) => ({
+        async *[Symbol.asyncIterator]() {
+          const { canUseTool } = opts.options || {};
+          if (canUseTool) {
+            const r1 = await canUseTool("Read", { path: "/tmp/barrier-b" }, {
+              signal: new AbortController().signal,
+              toolUseID: "tool-b",
+            });
+            decisions.push(r1?.behavior ?? "reject");
+            expect(r1.behavior).toBe("allow");
+          }
+          yield { type: "result", subtype: "success", result: "done", duration_ms: 10, num_turns: 1, total_cost_usd: 0 };
+        },
+        close() {},
+        async interrupt() {},
+      }),
+      createSdkMcpServer: (opts: any) => new MockMcpServer(opts),
+    }));
+
+    const modB = await import(`${adapterPath}?perm-barrier-b-${Date.now()}`);
+    const hostB = new TestHost({ config: modB.adapterConfig, autoGrantPermissions: false });
+    await hostB.start();
+    await hostB.openSession({ config: { claude_executable: FAKE_CLI } });
+    const routerB = PermissionRequestRouter.acquire(hostB);
+    const runB = executeWithPermissionRouter(hostB, {
+      stepName: "barrier-b",
+      input: { prompt: "barrier host b" },
+      allowedOutcomes: ["success"],
+      router: routerB,
+    });
+
+    // Pending while A is already torn down; the explicit release must then
+    // resolve allow on B's own single live consumer, never as a stray deny.
+    await routerB.waitRouted(1);
+    routerB.grant(1);
+    const { outcome: outcomeB } = await runB;
+
+    expect(decisions).toEqual(["allow"]);
+    expect(routerB.consumerDeath()).toBeNull();
+    expect(routerB.defects()).toEqual([]);
+    expect(routerB.routedCount()).toBe(1);
+    expect(routerB.grantedCount()).toBe(1);
+    expect(routerB.grantedSequences()).toEqual([1]);
+    expect(["success", "failure", "needs_review"]).toContain(outcomeB);
+
+    // B's own teardown through the barrier settles without tainting the
+    // routing invariants, even though host.stop() then touches the ended call.
+    await stopHost(hostB);
+    expect(routerB.streamEnded()).toBe(true);
+    expect(routerB.consumerDeath()).toBeNull();
+    expect(routerB.defects()).toEqual([]);
   }, 30_000);
 });
 
@@ -737,7 +852,7 @@ describe("permission router fail-closed contract (KB-261 layer-2 negative paths)
     expect(router.routedCount()).toBe(1);
     expect(router.grantedCount()).toBe(1);
     expect(writes.length).toBe(1);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("grant() after the consumer died is fail-closed: typed stale-consumer defect, nothing written", async () => {
@@ -761,7 +876,7 @@ describe("permission router fail-closed contract (KB-261 layer-2 negative paths)
     );
     expect(router.grantedCount()).toBe(0);
     expect(writes.length).toBe(0);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("grant() for an uncorrelated request is a typed defect and never written", async () => {
@@ -775,7 +890,7 @@ describe("permission router fail-closed contract (KB-261 layer-2 negative paths)
     expect(router.routedCount()).toBe(0);
     expect(router.grantedCount()).toBe(0);
     expect(writes.length).toBe(0);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("noteDeliveryFailure() records the typed defect, sets the dead reason, and stays fail-closed", async () => {
@@ -797,7 +912,7 @@ describe("permission router fail-closed contract (KB-261 layer-2 negative paths)
     expect(writes.length).toBe(0);
     expect(router.defects().length).toBe(2);
     expect(router.defects()[1]).toContain("would deliver to a stale consumer");
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 
   test("executeWithOutputs rejects typed when a timer-queued permission delay is requested", async () => {
@@ -818,7 +933,7 @@ describe("permission router fail-closed contract (KB-261 layer-2 negative paths)
     // The timer path never started a step: nothing routed, nothing resolved.
     expect(router.routedCount()).toBe(0);
     expect(router.grantedCount()).toBe(0);
-    await host.stop();
+    await stopHost(host);
   }, 30_000);
 });
 
@@ -956,7 +1071,7 @@ describe("permission-bridge quiesce (KB-261 ruling addendum)", () => {
       expect(drained?.timedOut).toBe(false);
     } finally {
       permStream.end?.();
-      await host.stop();
+      await stopHost(host);
     }
   }, 30_000);
 

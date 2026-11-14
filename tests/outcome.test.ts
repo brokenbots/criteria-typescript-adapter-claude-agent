@@ -22,6 +22,7 @@ import {
   MockQueryWithOutcomeAndSession,
   MockQueryHangs,
   MockQueryNoOutcome,
+  stopHost,
 } from "./helpers.js";
 
 class MockMcpServer {
@@ -391,7 +392,7 @@ describe("outcome integration", () => {
     expect(outcome).toBe("success");
     expect(Object.keys(outputs).sort()).toEqual(Object.keys(mod.adapterConfig.output_schema.fields).sort());
     expect(outputs.reason).toBe("Task completed successfully.");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("declared output_schema keys match emitted outputs on fallback path", async () => {
@@ -440,7 +441,7 @@ describe("outcome integration", () => {
     expect(outputs.reason).toContain("missing finalize");
     // No session_id is produced by the default MockQuery, so no reprompt turns occur.
     expect(outputs.reason).toContain("after 1 finalize attempt");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("declared output_schema types match emitted types", async () => {
@@ -466,7 +467,7 @@ describe("outcome integration", () => {
     const declaredType = mod.adapterConfig.output_schema.fields.reason?.type;
     expect(declaredType).toBe("string");
     expect(typeof outputs.reason).toBe("string");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("adapter does not declare outcome as a step output", async () => {
@@ -519,7 +520,7 @@ describe("outcome integration", () => {
     expect(outputs.reason).toBe(
       "I used key [REDACTED] and token [REDACTED] during my work."
     );
-    await host.stop();
+    await stopHost(host);
   });
 
   test("reason is passed through unchanged when it contains no held secret", async () => {
@@ -549,7 +550,7 @@ describe("outcome integration", () => {
 
     expect(outcome).toBe("success");
     expect(outputs.reason).toBe("Task completed successfully.");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("invalid submitted outcome is rejected and falls back to failure after max attempts", async () => {
@@ -572,7 +573,7 @@ describe("outcome integration", () => {
     expect(result.outcome).toBe("failure");
     expect(result.reason).toContain("invalid outcome");
     expect(result.reason).toContain("after 3 finalize attempt(s)");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("timeout emits failure outcome when step exceeds timeout_ms", async () => {
@@ -594,7 +595,7 @@ describe("outcome integration", () => {
 
     expect(result.outcome).toBe("failure");
     expect(result.reason).toMatch(/timed out|timeout/i);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("timeout returns needs_review when it is an allowed outcome", async () => {
@@ -616,7 +617,7 @@ describe("outcome integration", () => {
 
     expect(result.outcome).toBe("needs_review");
     expect(result.reason).toMatch(/timed out|timeout/i);
-    await host.stop();
+    await stopHost(host);
   });
 
   test("max attempts exhausted emits fallback failure outcome", async () => {
@@ -639,7 +640,7 @@ describe("outcome integration", () => {
     expect(result.outcome).toBe("failure");
     expect(result.reason).toContain("missing finalize");
     expect(result.reason).toContain("after 3 finalize attempt(s)");
-    await host.stop();
+    await stopHost(host);
   });
 
   test("no declared allowed outcomes disables finalization via submit_outcome", async () => {
@@ -662,6 +663,6 @@ describe("outcome integration", () => {
     expect(result.outcome).toBe("failure");
     expect(result.reason).toContain("step has no declared outcomes");
     expect(result.reason).toContain("after 1 finalize attempt");
-    await host.stop();
+    await stopHost(host);
   });
 });
