@@ -7,6 +7,7 @@ import {
   FAKE_CLI,
   MockMcpServer,
   mockClaudeSdk,
+  shutdownTestHost,
 } from "./helpers.js";
 
 mockClaudeSdk();
@@ -134,7 +135,7 @@ async function runWithReplay(
     input: { prompt: "call the other adapter's greet tool" },
     allowedOutcomes: ["success"],
   });
-  await host.stop();
+  await shutdownTestHost(host);
   return {
     result,
     toolResult: built.captured.toolResults[0],
