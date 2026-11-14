@@ -1,0 +1,7 @@
+# Bun 1.3.x runner defaults: individual test timeouts of 5s starve the real
+# (in-process gRPC plugin) permission path under runner load, killing tests
+# with "timed out after Nms" before any deterministic ordering assertion can
+# run (observed on 16-core dev, ubuntu runners under load, runs 42952988470 +
+# 42973180457). 120s bounds every test while assertions stay strict.
+[test]
+timeout = 120_000
